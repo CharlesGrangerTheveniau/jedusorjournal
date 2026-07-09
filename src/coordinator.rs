@@ -20,9 +20,17 @@ use crate::touch::Touch;
 pub enum TriggerEvent {
     /// User touched the trigger corner
     UserTouch,
+    /// User drew the spiral gesture; carries the anchor point (virtual px)
+    /// to place the answer below.
+    SpiralGesture { anchor_x: f32, anchor_y: f32 },
     /// Trigger via web API (for testing/simulation)
     WebTrigger,
 }
+
+/// Last spiral anchor point (virtual px), consumed by the write_cursive
+/// tool callback to place the answer. `None` after a corner-tap trigger —
+/// the tool falls back to a fixed position in that case.
+pub type GestureAnchor = Arc<TokioMutex<Option<(f32, f32)>>>;
 
 /// Progress states during AI processing
 /// Uses ModelExecutionStatus for LLM operations, plus additional states for the full workflow
@@ -86,6 +94,7 @@ pub async fn trigger_task(
     trigger_tx: mpsc::Sender<TriggerEvent>,
     cancellation: Arc<GhostwriterCancellation>,
     no_trigger: bool,
+    gesture_anchor: GestureAnchor,
 ) -> Result<()> {
     info!("Trigger task starting");
 
@@ -133,6 +142,10 @@ pub async fn trigger_task(
                 drop(touch_guard);
                 debug!("Trigger task: dropped touch write lock");
 
+                // Clear any stale gesture anchor so a corner tap after a
+                // stale spiral doesn't reuse an old anchor position.
+                *gesture_anchor.lock().await = None;
+
                 if trigger_tx.send(TriggerEvent::UserTouch).await.is_err() {
                     info!("Trigger receiver dropped, exiting trigger task");
                     break;
@@ -157,6 +170,38 @@ pub async fn trigger_task(
 
     debug!("Escaped from trigger task loop");
 
+    Ok(())
+}
+
+/// Task that waits for the spiral gesture and notifies the coordinator,
+/// running alongside `trigger_task`'s corner-tap watcher.
+pub async fn gesture_trigger_task(
+    mut watcher: crate::gesture::SpiralWatcher,
+    trigger_tx: mpsc::Sender<TriggerEvent>,
+    cancellation: Arc<GhostwriterCancellation>,
+    gesture_anchor: GestureAnchor,
+) -> Result<()> {
+    info!("Gesture trigger task starting");
+    loop {
+        match watcher.wait_for_spiral(&cancellation).await {
+            Ok((anchor_x, anchor_y)) => {
+                info!("Gesture trigger task: spiral detected at ({}, {})", anchor_x, anchor_y);
+                *gesture_anchor.lock().await = Some((anchor_x, anchor_y));
+                if trigger_tx.send(TriggerEvent::SpiralGesture { anchor_x, anchor_y }).await.is_err() {
+                    info!("Trigger receiver dropped, exiting gesture trigger task");
+                    break;
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("cancelled") {
+                    info!("Gesture trigger task: cancelled (likely config change)");
+                    return Ok(());
+                }
+                info!("Gesture trigger task: error waiting for spiral: {}", e);
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -349,12 +394,26 @@ pub async fn processing_task(
         None
     };
 
-    // Load prompt
-    let prompt_general_raw = load_config(&config.prompt);
+    // Select prompt: diary persona if the currently open document matches
+    // the configured diary notebook, otherwise the neutral cursive prompt
+    // (or the user's explicit --prompt override, for the legacy draw_text/
+    // draw_svg experience).
+    let prompt_file = if config.prompt != "general.json" {
+        config.prompt.clone()
+    } else {
+        match (&config.diary_notebook, crate::notebook::detect_open_document()) {
+            (Some(diary_uuid), Some(open_uuid)) if diary_uuid == &open_uuid => {
+                info!("processing_task: diary notebook open, using diary persona");
+                "diary.json".to_string()
+            }
+            _ => "neutral_cursive.json".to_string(),
+        }
+    };
+    let prompt_general_raw = load_config(&prompt_file);
     let prompt_general_json = serde_json::from_str::<serde_json::Value>(prompt_general_raw.as_str())?;
     let mut prompt = prompt_general_json["prompt"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Prompt file '{}' missing required 'prompt' field", config.prompt))?
+        .ok_or_else(|| anyhow::anyhow!("Prompt file '{}' missing required 'prompt' field", prompt_file))?
         .to_string();
 
     // Add segmentation to prompt if available

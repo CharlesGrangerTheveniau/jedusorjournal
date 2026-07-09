@@ -134,3 +134,146 @@ mod tests {
         assert!(!is_spiral(&points, 500, &SpiralConfig::default()));
     }
 }
+
+// --- Task 10: stateful watcher that reads the real pen input device ---
+
+use anyhow::Result;
+use evdev::{Device, EventStream, EventType as EvdevEventType};
+use log::{debug, info};
+use std::time::Instant;
+
+use crate::cancellation::GhostwriterCancellation;
+use crate::device::DeviceModel;
+
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
+const BTN_TOUCH: u16 = 330;
+
+// Duplicated from pen.rs / touch.rs by existing project convention (each
+// device-facing module keeps its own copy of these small constants rather
+// than sharing a central module).
+const VIRTUAL_WIDTH: f32 = 768.0;
+const VIRTUAL_HEIGHT: f32 = 1024.0;
+
+fn pen_max_x(device_model: DeviceModel) -> f32 {
+    match device_model {
+        DeviceModel::RemarkablePaperPro => 11180.0,
+        _ => 15725.0,
+    }
+}
+
+fn pen_max_y(device_model: DeviceModel) -> f32 {
+    match device_model {
+        DeviceModel::RemarkablePaperPro => 15340.0,
+        _ => 20966.0,
+    }
+}
+
+fn input_to_virtual((x, y): (f32, f32), device_model: DeviceModel) -> (f32, f32) {
+    let max_x = pen_max_x(device_model);
+    let max_y = pen_max_y(device_model);
+    match device_model {
+        DeviceModel::RemarkablePaperPro => (x / max_x * VIRTUAL_WIDTH, y / max_y * VIRTUAL_HEIGHT),
+        // RM2: pen input space is swapped/flipped relative to virtual space,
+        // mirroring Pen::virtual_to_input's inverse.
+        _ => (y / max_x * VIRTUAL_WIDTH, (1.0 - x / max_y) * VIRTUAL_HEIGHT),
+    }
+}
+
+pub struct SpiralWatcher {
+    event_stream: Option<EventStream>,
+    device_model: DeviceModel,
+    config: SpiralConfig,
+    log_gestures: bool,
+}
+
+impl SpiralWatcher {
+    pub fn new(no_gesture: bool, config: SpiralConfig, log_gestures: bool) -> Self {
+        let device_model = DeviceModel::detect();
+        let pen_input_device = match device_model {
+            DeviceModel::RemarkablePaperPro => "/dev/input/event2",
+            _ => "/dev/input/event1",
+        };
+        let event_stream = if no_gesture {
+            None
+        } else {
+            Device::open(pen_input_device).ok().and_then(|d| d.into_event_stream().ok())
+        };
+        Self {
+            event_stream,
+            device_model,
+            config,
+            log_gestures,
+        }
+    }
+
+    /// Wait until a spiral is drawn on the pen digitizer, returning its
+    /// bounding-box center in virtual screen coordinates (used to anchor
+    /// the answer below the question). Never returns on a non-spiral
+    /// stroke — it keeps buffering strokes until one matches.
+    pub async fn wait_for_spiral(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
+        let Some(stream) = &mut self.event_stream else {
+            // No-gesture mode: block until cancelled, like Touch's no-stream path.
+            loop {
+                if cancellation.should_cancel_main() {
+                    return Err(anyhow::anyhow!("Gesture waiting cancelled"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        let mut points: Vec<(f32, f32)> = Vec::new();
+        let mut cur_x = 0.0f32;
+        let mut cur_y = 0.0f32;
+        let mut stroke_start: Option<Instant> = None;
+
+        loop {
+            let event = tokio::select! {
+                _ = async {
+                    while !cancellation.should_cancel_main() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => return Err(anyhow::anyhow!("Gesture waiting cancelled")),
+                ev = stream.next_event() => ev?,
+            };
+
+            match (event.event_type(), event.code(), event.value()) {
+                (EvdevEventType::KEY, BTN_TOUCH, 1) => {
+                    points.clear();
+                    stroke_start = Some(Instant::now());
+                }
+                (EvdevEventType::ABSOLUTE, ABS_X, v) => cur_x = v as f32,
+                (EvdevEventType::ABSOLUTE, ABS_Y, v) => cur_y = v as f32,
+                (EvdevEventType::KEY, BTN_TOUCH, 0) => {
+                    let Some(start) = stroke_start.take() else { continue };
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let virtual_points: Vec<(f32, f32)> =
+                        points.iter().map(|&p| input_to_virtual(p, self.device_model)).collect();
+
+                    if self.log_gestures {
+                        info!(
+                            "gesture stroke: {} points, duration={}ms — see is_spiral() for accept/reject",
+                            virtual_points.len(),
+                            duration_ms
+                        );
+                    }
+
+                    if is_spiral(&virtual_points, duration_ms, &self.config) {
+                        let (min_x, _min_y, max_x, max_y) = virtual_points.iter().fold(
+                            (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
+                            |(mnx, mny, mxx, mxy), &(x, y)| (mnx.min(x), mny.min(y), mxx.max(x), mxy.max(y)),
+                        );
+                        return Ok(((min_x + max_x) / 2.0, max_y));
+                    }
+                    debug!("gesture stroke rejected as non-spiral");
+                }
+                (EvdevEventType::SYNCHRONIZATION, _, _) => {
+                    if stroke_start.is_some() {
+                        points.push((cur_x, cur_y));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}

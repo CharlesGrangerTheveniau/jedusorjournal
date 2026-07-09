@@ -450,8 +450,12 @@ async fn run_ghostwriter_loop(
 
     let mut engine = create_engine(&engine_name, &engine_options)?;
 
+    // Shared state for the last spiral gesture anchor, consumed by the
+    // write_cursive tool and cleared by trigger_task on a corner tap.
+    let gesture_anchor: coordinator::GestureAnchor = Arc::new(TokioMutex::new(None));
+
     // Register tools
-    register_tools(&mut engine, Arc::clone(&keyboard), Arc::clone(&pen), Arc::clone(&touch), &config)?;
+    register_tools(&mut engine, Arc::clone(&keyboard), Arc::clone(&pen), Arc::clone(&touch), &config, &gesture_anchor)?;
 
     let engine = Arc::new(TokioMutex::new(engine));
 
@@ -461,7 +465,22 @@ async fn run_ghostwriter_loop(
         let trigger_tx = channels.trigger_tx.clone();
         let cancellation = Arc::clone(&cancellation);
         let no_trigger = config.no_trigger;
-        tokio::spawn(async move { coordinator::trigger_task(touch, trigger_tx, cancellation, no_trigger).await })
+        let gesture_anchor = Arc::clone(&gesture_anchor);
+        tokio::spawn(async move { coordinator::trigger_task(touch, trigger_tx, cancellation, no_trigger, gesture_anchor).await })
+    };
+
+    let gesture_handle = {
+        let trigger_tx = channels.trigger_tx.clone();
+        let cancellation = Arc::clone(&cancellation);
+        let gesture_anchor = Arc::clone(&gesture_anchor);
+        let spiral_config = ghostwriter::gesture::SpiralConfig {
+            min_turn_degrees: config.gesture_min_turn_degrees,
+            min_bbox_px: config.gesture_min_bbox_px,
+            max_bbox_px: config.gesture_max_bbox_px,
+            max_duration_ms: config.gesture_max_duration_ms,
+        };
+        let watcher = ghostwriter::gesture::SpiralWatcher::new(config.no_gesture || config.no_draw, spiral_config, config.log_gestures);
+        tokio::spawn(async move { coordinator::gesture_trigger_task(watcher, trigger_tx, cancellation, gesture_anchor).await })
     };
 
     let progress_handle = {
@@ -591,12 +610,28 @@ async fn run_ghostwriter_loop(
         Err(_) => info!("Progress task shutdown timed out"),
     }
 
+    match tokio::time::timeout(shutdown_timeout, gesture_handle).await {
+        Ok(Ok(Ok(_))) => info!("Gesture task completed successfully"),
+        Ok(Ok(Err(e))) => info!("Gesture task error: {}", e),
+        Ok(Err(e)) => info!("Gesture task join error: {}", e),
+        Err(_) => {
+            info!("Gesture task shutdown timed out - this is expected in no-gesture mode");
+        }
+    }
+
     info!("Main: clean shutdown complete");
     Ok(())
 }
 
 // Helper function to register tools with the engine
-fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>>, pen: Arc<Mutex<Pen>>, _touch: Arc<TokioRwLock<Touch>>, config: &Config) -> Result<()> {
+fn register_tools(
+    engine: &mut Box<dyn LLMEngine>,
+    keyboard: Arc<Mutex<Keyboard>>,
+    pen: Arc<Mutex<Pen>>,
+    _touch: Arc<TokioRwLock<Touch>>,
+    config: &Config,
+    gesture_anchor: &coordinator::GestureAnchor,
+) -> Result<()> {
     use serde_json::Value as json;
 
     // Register draw_text tool
@@ -684,6 +719,50 @@ fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>
                             Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
                         })
                     }).ok();
+                }
+            }),
+        );
+    }
+
+    // Register write_cursive tool
+    if !config.no_svg {
+        let no_draw = config.no_draw;
+        let pen_clone = Arc::clone(&pen);
+        let cursive_config = ghostwriter::cursive::CursiveConfig {
+            layout: ghostwriter::cursive::LayoutConfig {
+                x_height_px: config.cursive_x_height_px,
+                ..Default::default()
+            },
+            word_gap_ms: config.cursive_word_gap_ms,
+            ..Default::default()
+        };
+        let font = ghostwriter::cursive::CursiveFont::embedded_allure()?;
+        let gesture_anchor = Arc::clone(gesture_anchor);
+
+        let tool_config_write_cursive = load_config("tool_write_cursive.json");
+        engine.register_tool(
+            "write_cursive",
+            serde_json::from_str::<serde_json::Value>(tool_config_write_cursive.as_str())?,
+            Box::new(move |arguments: json| {
+                let text = match arguments["text"].as_str() {
+                    Some(t) => t,
+                    None => {
+                        log::error!("write_cursive tool called without valid 'text' argument");
+                        return;
+                    }
+                };
+                let x = arguments["x"].as_i64().unwrap_or(60) as f32;
+                let width = arguments["width"].as_i64().unwrap_or(650) as f32;
+                let y = arguments["y"].as_i64().map(|v| v as f32).unwrap_or_else(|| {
+                    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { gesture_anchor.lock().await.map(|(_, ay)| ay).unwrap_or(400.0) }))
+                });
+
+                if !no_draw {
+                    let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
+                    let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
+                    if let Err(e) = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed) {
+                        log::error!("Failed to write cursive: {}", e);
+                    }
                 }
             }),
         );
