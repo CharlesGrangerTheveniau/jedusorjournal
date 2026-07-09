@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod cursive;
 pub mod device;
 pub mod embedded_assets;
+pub mod gesture;
 pub mod keyboard;
 pub mod llm_engine;
 pub mod pen;
