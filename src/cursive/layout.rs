@@ -51,13 +51,49 @@ fn in_connection_zone(y: f32) -> bool {
     (y - CONNECTION_ZONE_CENTER).abs() <= CONNECTION_ZONE_HALF_WIDTH
 }
 
+/// Maximum screen-space distance (as a multiple of `config.x_height_px`)
+/// between a glyph's main-stroke exit point and the next glyph's main-stroke
+/// entry point for the two to be spliced into one continuous stroke, even
+/// when both fall inside the Y-height connection zone above. The Y-zone
+/// check alone is not sufficient: it only constrains vertical position, and
+/// with CONNECTION_ZONE_HALF_WIDTH as wide as 165 units, two glyphs can both
+/// land inside the band while sitting far apart in screen space, producing a
+/// straight-line artifact when the renderer connects them directly.
+///
+/// Measured on the embedded EMS Allure font by instrumenting `layout()` to
+/// print the Euclidean gap for every consecutive pair in "Bonjour, je
+/// m'appelle Tom Jedusor. Où étais-tu ?" at `LayoutConfig::default()`
+/// (x_height_px=28.0), then cross-checking each gap against the rendered
+/// golden PNG:
+///   - Confirmed-good joins (smooth curve, no visible seam): 'a'->'m' in the
+///     existing "am" test (21.82px), 'a'->'i' in "étais" (21.82px,
+///     identical shape to 'a'->'m'), 'j'->'o' in "Bonjour" (25.52px,
+///     visually part of the 'o' loop's own stroke), 'o'->'u' in "Bonjour"
+///     (20.50px).
+///   - Confirmed-bad joins (hard straight line with a sharp corner, visually
+///     confirmed against the golden PNG): 'o'->'n' in "Bonjour" (30.06px),
+///     'p'->'e' in "m'appelle" (49.64px), 't'->'a' in "étais" (49.19px).
+/// The good/bad sets are cleanly separated (max good = 25.52px, min bad =
+/// 30.06px), so 1.0x the x-height (28.0px at the default config) sits in
+/// that gap with margin on both sides and scales correctly if x_height_px
+/// changes.
+const MAX_JOIN_GAP_X_HEIGHT_MULT: f32 = 1.0;
+
+fn join_gap_distance(prev_exit: (f32, f32), entry: (f32, f32)) -> f32 {
+    let dx = entry.0 - prev_exit.0;
+    let dy = entry.1 - prev_exit.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
 /// Lay out `text` into wrapped lines within `placement.max_width`, placing
 /// each glyph left-to-right and converting font-space coordinates
 /// (Y-up, baseline 0) into virtual screen-space coordinates (Y-down).
 /// Consecutive glyphs whose main-stroke exit/entry both fall in the
-/// connection zone are spliced into one continuous stroke so the pen
-/// stays down across the join; everything else (word gaps, accents,
-/// out-of-zone pairs) becomes a separate stroke (a pen lift).
+/// connection zone, AND whose exit/entry points are close enough in
+/// screen space (see `MAX_JOIN_GAP_X_HEIGHT_MULT`), are spliced into one
+/// continuous stroke so the pen stays down across the join; everything
+/// else (word gaps, accents, out-of-zone pairs, and same-zone pairs that
+/// are simply too far apart) becomes a separate stroke (a pen lift).
 pub fn layout(font: &CursiveFont, text: &str, placement: &Placement, config: &LayoutConfig) -> Vec<Word> {
     let scale = config.x_height_px / font.x_height;
     let line_height = config.x_height_px * config.line_spacing_mult;
@@ -105,7 +141,20 @@ pub fn layout(font: &CursiveFont, text: &str, placement: &Placement, config: &La
                         // font-space units) would never match.
                         let prev_font_y = (cursor_y - prev.1) / scale;
                         let cur_font_y = (cursor_y - cur.1) / scale;
-                        in_connection_zone(prev_font_y) && in_connection_zone(cur_font_y)
+                        let zone_ok = in_connection_zone(prev_font_y) && in_connection_zone(cur_font_y);
+
+                        // Y-zone agreement alone isn't enough: two glyphs can
+                        // both land inside the (wide) connection zone while
+                        // sitting far apart in screen space. Without this
+                        // distance cap, `strokes[idx].extend(...)` below
+                        // splices the two point lists together and the
+                        // renderer draws a straight line across whatever gap
+                        // separates them, producing jarring, spec-violating
+                        // artifacts (see MAX_JOIN_GAP_X_HEIGHT_MULT doc for
+                        // the measured evidence).
+                        let gap_ok = join_gap_distance(prev, cur) <= config.x_height_px * MAX_JOIN_GAP_X_HEIGHT_MULT;
+
+                        zone_ok && gap_ok
                     }
                     _ => false,
                 };
@@ -278,6 +327,50 @@ mod tests {
             eacute_accent_len <= 4,
             "é's accent stroke should remain its short diacritic mark, not have 't' joined onto it (got {} points)",
             eacute_accent_len
+        );
+    }
+
+    #[test]
+    fn distant_same_zone_join_does_not_splice_into_one_stroke() {
+        let font = test_font();
+        let placement = Placement {
+            x: 40.0,
+            y: 200.0,
+            max_width: 700.0,
+        };
+        // 'o' and 'n' both fall inside the Y-height connection zone (in
+        // font-space y terms) so the old zone-only check joined them, but
+        // in screen space at the default config their exit/entry points are
+        // 30.06px apart ((140.8,173.5) -> (170.6,169.4), measured directly
+        // from this exact layout call) — well above one x-height (28.0px)
+        // and clearly outside the confirmed-good range (max observed good
+        // gap was 25.52px, for 'j'->'o' in the same word). Splicing them
+        // produced a hard, straight-line, sharp-cornered artifact cutting
+        // across "Bonjour" in the rendered golden PNG. They must now land
+        // in separate strokes.
+        // The embedded font's 'o' glyph has 2 subpaths (a 13-point main
+        // stroke plus a short 6-point secondary stroke) and 'n' has a
+        // single 15-point main stroke. Verified via debug printing of
+        // `word.strokes.iter().map(|s| s.len())`, which showed [13, 6, 15]
+        // when unjoined. If 'o' and 'n' were (incorrectly) joined, 'n's 15
+        // points would be absorbed into 'o's main stroke instead, giving
+        // [28, 6] — 2 strokes, with the first grown past its own length.
+        let o_main_len = font.glyphs.get(&'o').unwrap().subpaths[0].len();
+        eprintln!("VERIFY o_main_len={}", o_main_len);
+
+        let words = layout(&font, "on", &placement, &LayoutConfig::default());
+        assert_eq!(words.len(), 1);
+        assert_eq!(
+            words[0].strokes.len(),
+            3,
+            "expected 'o' (main + secondary subpath) and 'n' (main) to remain 3 separate strokes \
+             (gap too large despite matching Y-zone), got strokes {:?}",
+            words[0].strokes.iter().map(|s| s.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            words[0].strokes[0].len(),
+            o_main_len,
+            "expected 'o's main stroke to NOT have absorbed 'n's main stroke"
         );
     }
 
