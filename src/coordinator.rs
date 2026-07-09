@@ -398,8 +398,8 @@ pub async fn processing_task(
     // the configured diary notebook, otherwise the neutral cursive prompt
     // (or the user's explicit --prompt override, for the legacy draw_text/
     // draw_svg experience).
-    let prompt_file = if config.prompt != "general.json" {
-        config.prompt.clone()
+    let prompt_file = if let Some(explicit) = &config.prompt {
+        explicit.clone()
     } else {
         match (&config.diary_notebook, crate::notebook::detect_open_document()) {
             (Some(diary_uuid), Some(open_uuid)) if diary_uuid == &open_uuid => {

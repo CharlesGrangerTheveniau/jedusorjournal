@@ -57,8 +57,8 @@ pub struct Args {
     model: String,
 
     /// Sets the prompt to use
-    #[arg(long, default_value = "general.json")]
-    prompt: String,
+    #[arg(long)]
+    prompt: Option<String>,
 
     /// Do not actually submit to the model, for testing
     #[arg(short, long)]
@@ -727,6 +727,7 @@ fn register_tools(
     // Register write_cursive tool
     if !config.no_svg {
         let no_draw = config.no_draw;
+        let test_mode = config.is_test_mode();
         let pen_clone = Arc::clone(&pen);
         let cursive_config = ghostwriter::cursive::CursiveConfig {
             layout: ghostwriter::cursive::LayoutConfig {
@@ -758,10 +759,32 @@ fn register_tools(
                 });
 
                 if !no_draw {
+                    // Switch to fineliner before drawing, remember original tool for restore
+                    // Use a fresh Touch instance to avoid deadlock with trigger_task which
+                    // holds the shared touch RwLock indefinitely while waiting for user trigger
+                    let previous_tool = if !no_draw && !test_mode {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await
+                            })
+                        }).unwrap_or(PenTool::Unknown)
+                    } else {
+                        PenTool::Unknown
+                    };
+
                     let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
                     let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
                     if let Err(e) = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed) {
                         log::error!("Failed to write cursive: {}", e);
+                    }
+
+                    // Restore the original tool after drawing
+                    if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
+                            })
+                        }).ok();
                     }
                 }
             }),
