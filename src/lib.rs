@@ -8,6 +8,7 @@ pub mod embedded_assets;
 pub mod gesture;
 pub mod keyboard;
 pub mod llm_engine;
+pub mod notebook;
 pub mod pen;
 pub mod screenshot;
 pub mod segmenter;
