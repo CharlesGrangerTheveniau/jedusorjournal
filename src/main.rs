@@ -132,6 +132,43 @@ pub struct Args {
     #[arg(long, default_value = "UR")]
     trigger_corner: String,
 
+    /// UUID of the designated diary notebook (gets the Tom Jedusor persona prompt).
+    /// Any other document still gets a cursive answer via the neutral prompt.
+    #[arg(long)]
+    diary_notebook: Option<String>,
+
+    /// Cursive x-height in virtual pixels (glyph size)
+    #[arg(long, default_value = "28.0")]
+    cursive_x_height_px: f32,
+
+    /// Pause between words while writing cursive, in milliseconds
+    #[arg(long, default_value = "220")]
+    cursive_word_gap_ms: u64,
+
+    /// Minimum cumulative turning angle (degrees) for a stroke to count as the trigger spiral
+    #[arg(long, default_value = "720.0")]
+    gesture_min_turn_degrees: f32,
+
+    /// Minimum bounding-box size (virtual px) for the trigger spiral
+    #[arg(long, default_value = "15.0")]
+    gesture_min_bbox_px: f32,
+
+    /// Maximum bounding-box size (virtual px) for the trigger spiral
+    #[arg(long, default_value = "60.0")]
+    gesture_max_bbox_px: f32,
+
+    /// Maximum duration (ms) for the trigger spiral to be drawn in
+    #[arg(long, default_value = "1500")]
+    gesture_max_duration_ms: u64,
+
+    /// Disable the spiral gesture trigger (corner tap still works)
+    #[arg(long)]
+    no_gesture: bool,
+
+    /// Log per-stroke geometry (turn angle, bbox, duration) for calibrating gesture thresholds
+    #[arg(long)]
+    log_gestures: bool,
+
     /// Save current configuration to ~/.ghostwriter.toml and exit
     #[arg(long)]
     save_config: bool,

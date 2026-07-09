@@ -1,0 +1,31 @@
+{
+  "name": "write_cursive",
+  "description": "Write your answer to the screen as animated, connected cursive handwriting. Use this instead of draw_text or draw_svg whenever you want to reply in the diary's own hand.",
+  "internal_command": "write_cursive",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "input_description": {
+        "type": "string",
+        "description": "Description of what was detected in the input image, including the exact pixel x, y, width, height bounding box of the user's question and where it ends."
+      },
+      "text": {
+        "type": "string",
+        "description": "The text to write in cursive. Write in the same language as the question (French or English). Keep it concise — a sentence or two."
+      },
+      "x": {
+        "type": "integer",
+        "description": "Left edge x coordinate (px, 0-768) where the cursive answer should start, in the 768x1024 virtual screen space."
+      },
+      "y": {
+        "type": "integer",
+        "description": "Baseline y coordinate (px, 0-1024) of the first line of the cursive answer. Place it just below the end of the user's question."
+      },
+      "width": {
+        "type": "integer",
+        "description": "Maximum width (px) the answer may wrap within before starting a new line."
+      }
+    },
+    "required": ["input_description", "text", "x", "y", "width"]
+  }
+}
