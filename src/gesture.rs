@@ -251,10 +251,17 @@ impl SpiralWatcher {
                         points.iter().map(|&p| input_to_virtual(p, self.device_model)).collect();
 
                     if self.log_gestures {
+                        let (bx0, by0, bx1, by1) = bounding_box(&virtual_points);
+                        let bbox_dim = (bx1 - bx0).max(by1 - by0);
+                        let turn = cumulative_turn_degrees(&virtual_points).abs();
+                        let accepted = is_spiral(&virtual_points, duration_ms, &self.config);
                         info!(
-                            "gesture stroke: {} points, duration={}ms — see is_spiral() for accept/reject",
+                            "gesture stroke: {} points, duration={}ms, bbox_max_dim={:.1}px, turn={:.1}deg => {}",
                             virtual_points.len(),
-                            duration_ms
+                            duration_ms,
+                            bbox_dim,
+                            turn,
+                            if accepted { "ACCEPTED as spiral" } else { "rejected" }
                         );
                     }
 
