@@ -1,46 +1,53 @@
-//! Spiral gesture detection: the user ends a question with a small,
-//! deliberate spiral flourish, which triggers the diary to answer.
+//! Double-tap gesture detection: the user ends a question with two quick,
+//! adjacent taps of the pen (like adding an extra period: ".."), which
+//! triggers the diary to answer.
 
 #[derive(Debug, Clone, Copy)]
-pub struct SpiralConfig {
-    pub min_turn_degrees: f32,
-    pub min_bbox_px: f32,
-    pub max_bbox_px: f32,
-    pub max_duration_ms: u64,
+pub struct DoubleTapConfig {
+    pub max_tap_duration_ms: u64,
+    pub max_tap_bbox_px: f32,
+    pub max_pair_gap_ms: u64,
+    pub max_pair_distance_px: f32,
 }
 
-impl Default for SpiralConfig {
+impl Default for DoubleTapConfig {
     fn default() -> Self {
         Self {
-            min_turn_degrees: 720.0,
-            min_bbox_px: 15.0,
-            max_bbox_px: 60.0,
-            max_duration_ms: 1500,
+            max_tap_duration_ms: 400,
+            max_tap_bbox_px: 12.0,
+            max_pair_gap_ms: 1200,
+            max_pair_distance_px: 20.0,
         }
     }
 }
 
-/// Detect whether a completed pen stroke (points in virtual screen space,
-/// in drawing order) is a spiral: at least two consistent-winding loops,
-/// drawn as a small deliberate mark, quickly. This rejects casual circles
-/// / letters like 'o' or 'e' (single loop, ~360°) and large scribbles
-/// (bbox too big) as well as slow multi-loop doodles (duration too long).
-pub fn is_spiral(points: &[(f32, f32)], duration_ms: u64, config: &SpiralConfig) -> bool {
-    if points.len() < 8 {
+/// Detect whether a completed pen stroke (points in virtual screen space)
+/// is a "tap": a small, quick, nearly-stationary mark like a period —
+/// clearly smaller and faster than any letter (verified on real device
+/// data: even the smallest tested letters were 20px+ and 300ms+).
+pub fn is_tap(points: &[(f32, f32)], duration_ms: u64, config: &DoubleTapConfig) -> bool {
+    if points.is_empty() {
         return false;
     }
-    if duration_ms > config.max_duration_ms {
+    if duration_ms > config.max_tap_duration_ms {
         return false;
     }
-
     let (min_x, min_y, max_x, max_y) = bounding_box(points);
     let max_dim = (max_x - min_x).max(max_y - min_y);
-    if max_dim < config.min_bbox_px || max_dim > config.max_bbox_px {
+    max_dim <= config.max_tap_bbox_px
+}
+
+/// Detect whether two taps (each already confirmed via `is_tap`) form a
+/// deliberate double-tap trigger: close together in time and adjacent in
+/// space, like two dots placed side by side at the end of a sentence.
+pub fn is_double_tap(first_center: (f32, f32), second_center: (f32, f32), gap_ms: u64, config: &DoubleTapConfig) -> bool {
+    if gap_ms > config.max_pair_gap_ms {
         return false;
     }
-
-    let turn = cumulative_turn_degrees(points).abs();
-    turn >= config.min_turn_degrees
+    let dx = second_center.0 - first_center.0;
+    let dy = second_center.1 - first_center.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    dist <= config.max_pair_distance_px
 }
 
 fn bounding_box(points: &[(f32, f32)]) -> (f32, f32, f32, f32) {
@@ -57,85 +64,77 @@ fn bounding_box(points: &[(f32, f32)]) -> (f32, f32, f32, f32) {
     (min_x, min_y, max_x, max_y)
 }
 
-/// Sum of signed turning angles at each interior point. A perfect circle
-/// traversed once accumulates ~360°; two consistent-winding loops
-/// accumulate ~720°. Reversing direction mid-stroke cancels out, which is
-/// intentional — a spiral has a single consistent winding direction.
-fn cumulative_turn_degrees(points: &[(f32, f32)]) -> f32 {
-    let mut total = 0.0f32;
-    for i in 1..points.len() - 1 {
-        let (x0, y0) = points[i - 1];
-        let (x1, y1) = points[i];
-        let (x2, y2) = points[i + 1];
-        let d1 = (x1 - x0, y1 - y0);
-        let d2 = (x2 - x1, y2 - y1);
-        let len1 = (d1.0 * d1.0 + d1.1 * d1.1).sqrt();
-        let len2 = (d2.0 * d2.0 + d2.1 * d2.1).sqrt();
-        if len1 < 0.01 || len2 < 0.01 {
-            continue;
-        }
-        let cross = d1.0 * d2.1 - d1.1 * d2.0;
-        let dot = d1.0 * d2.0 + d1.1 * d2.1;
-        total += cross.atan2(dot).to_degrees();
-    }
-    total
+fn bbox_center(points: &[(f32, f32)]) -> (f32, f32) {
+    let (min_x, min_y, max_x, max_y) = bounding_box(points);
+    ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Generate an Archimedean spiral of `loops` full turns, centered at
-    /// (cx, cy), with the given max radius, sampled at `n` points.
-    fn synthetic_spiral(cx: f32, cy: f32, max_radius: f32, loops: f32, n: usize) -> Vec<(f32, f32)> {
+    /// A small cluster of points confined to a tiny area, simulating a
+    /// quick pen tap (period-sized mark).
+    fn synthetic_tap(cx: f32, cy: f32, radius: f32, n: usize) -> Vec<(f32, f32)> {
         (0..n)
             .map(|i| {
-                let t = i as f32 / (n - 1) as f32;
-                let angle = t * loops * 2.0 * std::f32::consts::PI;
-                let radius = t * max_radius;
+                let t = i as f32 / (n - 1).max(1) as f32;
+                let angle = t * 2.0 * std::f32::consts::PI;
                 (cx + radius * angle.cos(), cy + radius * angle.sin())
             })
             .collect()
     }
 
     #[test]
-    fn detects_a_deliberate_two_loop_spiral() {
-        let points = synthetic_spiral(100.0, 100.0, 20.0, 2.5, 60);
-        assert!(is_spiral(&points, 800, &SpiralConfig::default()));
+    fn detects_a_quick_small_tap() {
+        let points = synthetic_tap(100.0, 100.0, 3.0, 6);
+        assert!(is_tap(&points, 150, &DoubleTapConfig::default()));
     }
 
     #[test]
-    fn rejects_a_straight_line() {
-        let points: Vec<(f32, f32)> = (0..20).map(|i| (i as f32 * 2.0, 0.0)).collect();
-        assert!(!is_spiral(&points, 500, &SpiralConfig::default()));
+    fn rejects_a_tap_that_is_too_big() {
+        // Bigger than any letter observed in real calibration data (20px+).
+        let points = synthetic_tap(100.0, 100.0, 15.0, 6);
+        assert!(!is_tap(&points, 150, &DoubleTapConfig::default()));
     }
 
     #[test]
-    fn rejects_a_single_loop_like_the_letter_o() {
-        let points = synthetic_spiral(100.0, 100.0, 20.0, 1.0, 40);
-        assert!(!is_spiral(&points, 500, &SpiralConfig::default()));
+    fn rejects_a_tap_drawn_too_slowly() {
+        let points = synthetic_tap(100.0, 100.0, 3.0, 6);
+        assert!(!is_tap(&points, 600, &DoubleTapConfig::default()));
     }
 
     #[test]
-    fn rejects_a_spiral_that_is_too_large() {
-        let points = synthetic_spiral(100.0, 100.0, 200.0, 2.5, 60);
-        assert!(!is_spiral(&points, 800, &SpiralConfig::default()));
+    fn rejects_an_empty_stroke() {
+        assert!(!is_tap(&[], 100, &DoubleTapConfig::default()));
     }
 
     #[test]
-    fn rejects_a_spiral_drawn_too_slowly() {
-        let points = synthetic_spiral(100.0, 100.0, 20.0, 2.5, 60);
-        assert!(!is_spiral(&points, 3000, &SpiralConfig::default()));
+    fn accepts_two_adjacent_taps_close_in_time() {
+        let config = DoubleTapConfig::default();
+        assert!(is_double_tap((100.0, 100.0), (110.0, 102.0), 500, &config));
     }
 
     #[test]
-    fn rejects_too_few_points() {
-        let points = vec![(0.0, 0.0), (1.0, 1.0)];
-        assert!(!is_spiral(&points, 500, &SpiralConfig::default()));
+    fn rejects_two_taps_too_far_apart_in_time() {
+        let config = DoubleTapConfig::default();
+        assert!(!is_double_tap((100.0, 100.0), (110.0, 102.0), 2000, &config));
+    }
+
+    #[test]
+    fn rejects_two_taps_too_far_apart_in_space() {
+        let config = DoubleTapConfig::default();
+        assert!(!is_double_tap((100.0, 100.0), (300.0, 100.0), 500, &config));
+    }
+
+    #[test]
+    fn bbox_center_of_a_single_point_is_itself() {
+        let points = vec![(50.0, 60.0)];
+        assert_eq!(bbox_center(&points), (50.0, 60.0));
     }
 }
 
-// --- Task 10: stateful watcher that reads the real pen input device ---
+// --- Stateful watcher that reads the real pen input device ---
 
 use anyhow::Result;
 use evdev::{Device, EventStream, EventType as EvdevEventType};
@@ -180,15 +179,15 @@ fn input_to_virtual((x, y): (f32, f32), device_model: DeviceModel) -> (f32, f32)
     }
 }
 
-pub struct SpiralWatcher {
+pub struct DoubleTapWatcher {
     event_stream: Option<EventStream>,
     device_model: DeviceModel,
-    config: SpiralConfig,
+    config: DoubleTapConfig,
     log_gestures: bool,
 }
 
-impl SpiralWatcher {
-    pub fn new(no_gesture: bool, config: SpiralConfig, log_gestures: bool) -> Self {
+impl DoubleTapWatcher {
+    pub fn new(no_gesture: bool, config: DoubleTapConfig, log_gestures: bool) -> Self {
         let device_model = DeviceModel::detect();
         let pen_input_device = match device_model {
             DeviceModel::RemarkablePaperPro => "/dev/input/event2",
@@ -207,11 +206,12 @@ impl SpiralWatcher {
         }
     }
 
-    /// Wait until a spiral is drawn on the pen digitizer, returning its
-    /// bounding-box center in virtual screen coordinates (used to anchor
-    /// the answer below the question). Never returns on a non-spiral
-    /// stroke — it keeps buffering strokes until one matches.
-    pub async fn wait_for_spiral(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
+    /// Wait until two adjacent, quick taps are drawn on the pen digitizer
+    /// (like ".."), returning the midpoint between them in virtual screen
+    /// coordinates. Any non-tap stroke (normal writing) clears a pending
+    /// first tap, so only genuinely adjacent taps — with nothing else drawn
+    /// in between — count as a pair.
+    pub async fn wait_for_double_tap(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
         let Some(stream) = &mut self.event_stream else {
             // No-gesture mode: block until cancelled, like Touch's no-stream path.
             loop {
@@ -226,6 +226,7 @@ impl SpiralWatcher {
         let mut cur_x = 0.0f32;
         let mut cur_y = 0.0f32;
         let mut stroke_start: Option<Instant> = None;
+        let mut pending_tap: Option<((f32, f32), Instant)> = None;
 
         loop {
             let event = tokio::select! {
@@ -249,30 +250,49 @@ impl SpiralWatcher {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let virtual_points: Vec<(f32, f32)> =
                         points.iter().map(|&p| input_to_virtual(p, self.device_model)).collect();
+                    let tap = is_tap(&virtual_points, duration_ms, &self.config);
 
                     if self.log_gestures {
                         let (bx0, by0, bx1, by1) = bounding_box(&virtual_points);
                         let bbox_dim = (bx1 - bx0).max(by1 - by0);
-                        let turn = cumulative_turn_degrees(&virtual_points).abs();
-                        let accepted = is_spiral(&virtual_points, duration_ms, &self.config);
                         info!(
-                            "gesture stroke: {} points, duration={}ms, bbox_max_dim={:.1}px, turn={:.1}deg => {}",
+                            "gesture stroke: {} points, duration={}ms, bbox_max_dim={:.1}px => {}",
                             virtual_points.len(),
                             duration_ms,
                             bbox_dim,
-                            turn,
-                            if accepted { "ACCEPTED as spiral" } else { "rejected" }
+                            if tap { "TAP" } else { "not a tap (normal writing)" }
                         );
                     }
 
-                    if is_spiral(&virtual_points, duration_ms, &self.config) {
-                        let (min_x, _min_y, max_x, max_y) = virtual_points.iter().fold(
-                            (f32::MAX, f32::MAX, f32::MIN, f32::MIN),
-                            |(mnx, mny, mxx, mxy), &(x, y)| (mnx.min(x), mny.min(y), mxx.max(x), mxy.max(y)),
-                        );
-                        return Ok(((min_x + max_x) / 2.0, max_y));
+                    if !tap {
+                        // Anything that isn't a tap clears a pending first
+                        // dot — a double-tap trigger requires the two taps
+                        // to be adjacent, with nothing else drawn between them.
+                        pending_tap = None;
+                        continue;
                     }
-                    debug!("gesture stroke rejected as non-spiral");
+
+                    let this_center = bbox_center(&virtual_points);
+                    match pending_tap.take() {
+                        Some((prev_center, prev_time)) => {
+                            let gap_ms = prev_time.elapsed().as_millis() as u64;
+                            if is_double_tap(prev_center, this_center, gap_ms, &self.config) {
+                                let anchor = (
+                                    (prev_center.0 + this_center.0) / 2.0,
+                                    (prev_center.1 + this_center.1) / 2.0,
+                                );
+                                info!("Double-tap detected at ({:.1}, {:.1})", anchor.0, anchor.1);
+                                return Ok(anchor);
+                            }
+                            // Too far apart in time/space to pair — this tap
+                            // becomes the new pending first dot instead.
+                            debug!("tap did not pair with previous tap; treating as new first tap");
+                            pending_tap = Some((this_center, Instant::now()));
+                        }
+                        None => {
+                            pending_tap = Some((this_center, Instant::now()));
+                        }
+                    }
                 }
                 (EvdevEventType::SYNCHRONIZATION, _, _) => {
                     if stroke_start.is_some() {

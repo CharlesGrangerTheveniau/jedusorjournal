@@ -145,23 +145,23 @@ pub struct Args {
     #[arg(long, default_value = "220")]
     cursive_word_gap_ms: u64,
 
-    /// Minimum cumulative turning angle (degrees) for a stroke to count as the trigger spiral
-    #[arg(long, default_value = "720.0")]
-    gesture_min_turn_degrees: f32,
+    /// Maximum duration (ms) for a single tap of the trigger double-tap
+    #[arg(long, default_value = "400")]
+    gesture_max_tap_duration_ms: u64,
 
-    /// Minimum bounding-box size (virtual px) for the trigger spiral
-    #[arg(long, default_value = "15.0")]
-    gesture_min_bbox_px: f32,
+    /// Maximum bounding-box size (virtual px) for a single tap of the trigger double-tap
+    #[arg(long, default_value = "12.0")]
+    gesture_max_tap_bbox_px: f32,
 
-    /// Maximum bounding-box size (virtual px) for the trigger spiral
-    #[arg(long, default_value = "60.0")]
-    gesture_max_bbox_px: f32,
+    /// Maximum gap (ms) between the two taps of the trigger double-tap
+    #[arg(long, default_value = "1200")]
+    gesture_max_pair_gap_ms: u64,
 
-    /// Maximum duration (ms) for the trigger spiral to be drawn in
-    #[arg(long, default_value = "1500")]
-    gesture_max_duration_ms: u64,
+    /// Maximum distance (virtual px) between the two taps of the trigger double-tap
+    #[arg(long, default_value = "20.0")]
+    gesture_max_pair_distance_px: f32,
 
-    /// Disable the spiral gesture trigger (corner tap still works)
+    /// Disable the double-tap gesture trigger (corner tap still works)
     #[arg(long)]
     no_gesture: bool,
 
@@ -473,13 +473,13 @@ async fn run_ghostwriter_loop(
         let trigger_tx = channels.trigger_tx.clone();
         let cancellation = Arc::clone(&cancellation);
         let gesture_anchor = Arc::clone(&gesture_anchor);
-        let spiral_config = ghostwriter::gesture::SpiralConfig {
-            min_turn_degrees: config.gesture_min_turn_degrees,
-            min_bbox_px: config.gesture_min_bbox_px,
-            max_bbox_px: config.gesture_max_bbox_px,
-            max_duration_ms: config.gesture_max_duration_ms,
+        let double_tap_config = ghostwriter::gesture::DoubleTapConfig {
+            max_tap_duration_ms: config.gesture_max_tap_duration_ms,
+            max_tap_bbox_px: config.gesture_max_tap_bbox_px,
+            max_pair_gap_ms: config.gesture_max_pair_gap_ms,
+            max_pair_distance_px: config.gesture_max_pair_distance_px,
         };
-        let watcher = ghostwriter::gesture::SpiralWatcher::new(config.no_gesture || config.no_draw, spiral_config, config.log_gestures);
+        let watcher = ghostwriter::gesture::DoubleTapWatcher::new(config.no_gesture || config.no_draw, double_tap_config, config.log_gestures);
         tokio::spawn(async move { coordinator::gesture_trigger_task(watcher, trigger_tx, cancellation, gesture_anchor).await })
     };
 
