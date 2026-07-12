@@ -526,14 +526,12 @@ async fn run_ghostwriter_loop(
                     let engine_clone = Arc::clone(&engine);
                     let progress_tx_clone = progress_tx.clone();
                     let cancellation_clone = Arc::clone(&cancellation);
-                    let touch_clone = Arc::clone(&touch);
                     tokio::spawn(async move {
                         coordinator::processing_task(
                             config_clone,
                             engine_clone,
                             progress_tx_clone,
                             cancellation_clone,
-                            touch_clone,
                         ).await
                     })
                 };

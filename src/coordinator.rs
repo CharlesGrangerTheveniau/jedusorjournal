@@ -326,7 +326,6 @@ pub async fn processing_task(
     engine: Arc<TokioMutex<Box<dyn LLMEngine>>>,
     progress_tx: watch::Sender<ProgressState>,
     cancellation: Arc<GhostwriterCancellation>,
-    touch: Arc<tokio::sync::RwLock<Touch>>,
 ) -> Result<()> {
     info!("Processing task: starting");
 
