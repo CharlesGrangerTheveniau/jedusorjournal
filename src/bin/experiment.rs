@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use evdev::{Device, EventType as EvdevEventType, InputEvent};
 use ghostwriter::pen::Pen;
 use ghostwriter::screenshot::Screenshot;
-use ghostwriter::touch::{PenTool, Touch, TriggerCorner};
+use ghostwriter::touch::{Touch, TriggerCorner};
 use ghostwriter::util::{svg_to_alpha_bitmap, svg_to_bitmap, svg_to_bitmap_threshold};
 use std::thread::sleep as std_sleep;
 use std::time::Duration;
@@ -312,33 +312,22 @@ async fn main() -> Result<()> {
 
         Commands::SelectFineliner => {
             let mut touch = Touch::new(false, TriggerCorner::UpperRight);
-            let previous = touch.select_fineliner().await?;
-            println!("SelectFineliner: switched to fineliner (was {:?})", previous);
+            touch.select_fineliner().await?;
+            println!("SelectFineliner: done");
         }
 
         Commands::SelectBallpoint => {
-            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
-            let previous = touch.switch_to_tool(PenTool::Ballpoint).await?;
-            println!("SelectBallpoint: switched to ballpoint (was {:?})", previous);
+            println!("SelectBallpoint: removed — no verified RM2 coordinate for this yet (see src/touch.rs's tool-palette-helpers comment). Use SelectFineliner or the diary's select_calligraphy_pen instead.");
         }
 
         Commands::ReadToolState => {
-            // Take a screenshot and report the detected tool state
+            // Take a screenshot and report whether the pen-tool sidebar slot
+            // is currently the highlighted one (matches Touch::pen_slot_is_active).
             let mut ss = Screenshot::new()?;
             ss.take_screenshot()?;
-            let palette_pixel = ss.get_pixel(70, 100);
-            let sidebar_pixel = ss.get_pixel(2, 77);
-            let palette_open = palette_pixel.map(|(r,_,_)| r < 128).unwrap_or(false);
-            let sidebar_dark = sidebar_pixel.map(|(r,_,_)| r < 128).unwrap_or(false);
-            let tool = if palette_open {
-                "UNKNOWN (palette is open)"
-            } else if sidebar_dark {
-                "Fineliner"
-            } else {
-                "Ballpoint"
-            };
-            println!("Tool state: {} | palette_open={} | sidebar_dark={}", tool, palette_open, sidebar_dark);
-            println!("  pixel(70,100)={:?}, pixel(2,77)={:?}", palette_pixel, sidebar_pixel);
+            let pen_slot_pixel = ss.get_pixel(5, 91);
+            let pen_active = pen_slot_pixel.map(|(r,_,_)| r < 128).unwrap_or(false);
+            println!("Pen slot active: {} | pixel(5,91)={:?}", pen_active, pen_slot_pixel);
         }
 
         Commands::DrawSvgBidi { svg_string } => {
@@ -411,14 +400,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Switch to fineliner (with correct size/color settings), run drawing closure, then restore.
+/// Switch to fineliner (with correct size/color settings), then run drawing closure.
+/// Deliberately does not restore the previous tool afterward — see
+/// src/touch.rs's tool-palette-helpers comment for why.
 async fn with_fineliner<F: FnOnce() -> Result<()>>(f: F) -> Result<()> {
     let mut touch = Touch::new(false, TriggerCorner::UpperRight);
-    let previous = touch.select_fineliner().await?;
+    touch.select_fineliner().await?;
     sleep(Duration::from_millis(500)).await; // Wait for palette close animation to finish
-    let result = f();
-    touch.restore_tool(previous).await?;
-    result
+    f()
 }
 
 async fn two_finger_tap(x: i32, y: i32) -> Result<()> {

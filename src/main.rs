@@ -20,7 +20,7 @@ use ghostwriter::{
     pen::Pen,
     simulation::SimulationConfig,
     status::GhostwriterStatus,
-    touch::{PenTool, Touch, TriggerCorner},
+    touch::{Touch, TriggerCorner},
     util::{setup_uinput, svg_to_alpha_bitmap, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
 };
@@ -689,18 +689,18 @@ fn register_tools(
                     }
                 }
 
-                // Switch to fineliner before drawing, remember original tool for restore
-                // Use a fresh Touch instance to avoid deadlock with trigger_task which
-                // holds the shared touch RwLock indefinitely while waiting for user trigger
-                let previous_tool = if !no_draw && !test_mode {
+                // Switch to fineliner before drawing. Use a fresh Touch instance to
+                // avoid deadlock with trigger_task, which holds the shared touch
+                // RwLock indefinitely while waiting for a corner-tap trigger. The
+                // tool is deliberately left on fineliner afterward (no restore) —
+                // see src/touch.rs's tool-palette-helpers comment for why.
+                if !no_draw && !test_mode {
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await
+                            let _ = Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await;
                         })
-                    }).unwrap_or(PenTool::Unknown)
-                } else {
-                    PenTool::Unknown
-                };
+                    });
+                }
 
                 let mut keyboard = lock!(keyboard_clone);
                 let mut pen = lock!(pen_clone);
@@ -709,15 +709,6 @@ fn register_tools(
                 }
                 drop(keyboard);
                 drop(pen);
-
-                // Restore the original tool after drawing
-                if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
-                        })
-                    }).ok();
-                }
             }),
         );
     }
@@ -757,32 +748,26 @@ fn register_tools(
                 });
 
                 if !no_draw {
-                    // Switch to fineliner before drawing, remember original tool for restore
-                    // Use a fresh Touch instance to avoid deadlock with trigger_task which
-                    // holds the shared touch RwLock indefinitely while waiting for user trigger
-                    let previous_tool = if !no_draw && !test_mode {
+                    // Switch to the calligraphy pen before drawing. Use a fresh Touch
+                    // instance to avoid deadlock with trigger_task, which holds the
+                    // shared touch RwLock indefinitely while waiting for a corner-tap
+                    // trigger. The tool is deliberately left on calligraphy afterward
+                    // (no restore) — see src/touch.rs's tool-palette-helpers comment
+                    // for why: restoring an arbitrary previous tool would need its own
+                    // verified coordinates per tool, which is exactly the kind of
+                    // unverified blind-tap risk that caused real content loss here.
+                    if !test_mode {
                         tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
-                                Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await
+                                let _ = Touch::new(false, TriggerCorner::UpperRight).select_calligraphy_pen().await;
                             })
-                        }).unwrap_or(PenTool::Unknown)
-                    } else {
-                        PenTool::Unknown
-                    };
+                        });
+                    }
 
                     let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
                     let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
                     if let Err(e) = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed) {
                         log::error!("Failed to write cursive: {}", e);
-                    }
-
-                    // Restore the original tool after drawing
-                    if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
-                            })
-                        }).ok();
                     }
                 }
             }),

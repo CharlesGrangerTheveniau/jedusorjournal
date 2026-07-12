@@ -11,15 +11,6 @@ use crate::device::DeviceModel;
 use crate::screenshot::Screenshot;
 use crate::simulation::{SimulationConfig, TouchSimulator};
 
-/// The active pen tool slot in the RMPP xochitl palette.
-/// These correspond to the first two slots in the pen type grid.
-/// Verified palette slot coordinates: Ballpoint=(96,119), Fineliner=(150,119).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PenTool {
-    Ballpoint,
-    Fineliner,
-    Unknown,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub enum TriggerCorner {
@@ -289,120 +280,44 @@ impl Touch {
     }
 
     // ── Tool palette helpers ────────────────────────────────────────────────
+    //
+    // Recalibrated 2026-07-12 against reMarkable 2 software 3.27.3.0's
+    // actual toolbar. The previous version of this code (see git history)
+    // was calibrated for a reMarkable Paper Pro's UI layout, which uses
+    // different coordinates entirely — on RM2 those coordinates landed on
+    // the Eraser icon instead of a pen type, and caused real, unrecoverable
+    // content loss during on-device testing of this feature (a drawing
+    // pass ran with the eraser active instead of a pen). Every coordinate
+    // below was individually verified on real hardware: tapped once, then
+    // confirmed via a screenshot showing the expected on-screen result
+    // (e.g. the settings panel's header text, or the sidebar's
+    // highlighted-icon pixel state) before being hardcoded here. Do not
+    // add or change a coordinate without the same verification, and do not
+    // reuse coordinates from any other reMarkable device or software
+    // version — verify fresh.
+    //
+    // RM2's toolbar has a single pen-type sidebar slot at PEN_SLOT: tapping
+    // it activates pen mode (recalling whichever type was last used) if
+    // some other tool is currently active, or opens a settings panel
+    // (pen type / stroke size / color) if pen mode is already active. The
+    // eraser lives in a separate, adjacent sidebar slot — intentionally
+    // not referenced anywhere below.
 
-    /// Palette toggle button (upper-left circle). Tapping toggles the palette open/closed.
-    const PALETTE_BUTTON: (i32, i32) = (35, 35);
+    /// The single pen-tool sidebar slot (RM2, software 3.27.3.0).
+    const PEN_SLOT: (i32, i32) = (28, 91);
 
-    /// Sidebar tool icon y-centers (virtual 768×1024 coords, x≈28).
-    /// Verified by screenshot analysis. All icons are at x≈28 when palette is open.
-    const SIDEBAR_Y_PEN1: i32 = 80;   // Mechanical pencil (pen slot 1)
-    const SIDEBAR_Y_PEN2: i32 = 130;  // Fineliner (pen slot 2) — used by ghostwriter
-    const SIDEBAR_Y_TEXT: i32 = 187;  // Text tool
-    const SIDEBAR_Y_ERASER: i32 = 240;
-    const SIDEBAR_X: i32 = 28;
+    /// Calligraphy pen icon within the settings panel's pen-type grid.
+    /// Verified: tapping this shows the panel header "Calligraphy pen".
+    const PEN_TYPE_CALLIGRAPHY: (i32, i32) = (231, 197);
 
-    /// Known sidebar tool y-centers for dynamic scanning.
-    const SIDEBAR_TOOL_YS: &'static [i32] = &[
-        Self::SIDEBAR_Y_PEN1,
-        Self::SIDEBAR_Y_PEN2,
-        Self::SIDEBAR_Y_TEXT,
-        Self::SIDEBAR_Y_ERASER,
-    ];
+    /// Fineliner icon within the same grid. Verified: header "Fineliner".
+    const PEN_TYPE_FINELINER: (i32, i32) = (170, 136);
 
-    /// Settings panel coordinates for the Fineliner pen (slot 2, y≈130).
-    /// NOTE: Tapping a pen-type icon closes the settings panel — skip that tap.
-    /// Only configure size and color; these taps keep the settings panel open.
-    const SETTINGS_SIZE_THIN: (i32, i32) = (96, 385);      // Thin stroke thickness
-    const SETTINGS_SIZE_MEDIUM: (i32, i32) = (150, 385);   // Medium stroke thickness
-    const SETTINGS_COLOR_BLACK: (i32, i32) = (96, 468);    // Black color (row 1, col 1)
+    /// Thin stroke-width icon within the settings panel.
+    const SETTINGS_SIZE_THIN: (i32, i32) = (109, 380);
 
-    /// Detect whether the palette is currently open by scanning the screenshot.
-    ///
-    /// When the palette is OPEN, the left ~55px wide strip shows tool icons.
-    /// We check whether there's substantial dark content in the sidebar region
-    /// (pixel at x=28, y=80 is dark = pen1 icon or selected-background visible).
-    /// When palette is CLOSED, only the toggle circle is visible; y=80 is white canvas.
-    fn screenshot_palette_open(ss: &Screenshot) -> bool {
-        // Check a pixel inside the expected sidebar tool area.
-        // Any dark content at this position = palette is open.
-        let is_open = (60u32..110).any(|y| {
-            ss.get_pixel(28, y).map(|(r, _, _)| r < 180).unwrap_or(false)
-        });
-        is_open
-    }
-
-    /// Scan the open palette sidebar and return the y-center of the currently selected tool.
-    ///
-    /// When the palette is open, the selected tool has a dark (inverted) background
-    /// spanning its full ~45px tall icon area. We scan x=5 (just inside the sidebar)
-    /// to find the largest contiguous dark band.
-    fn screenshot_selected_tool_y(ss: &Screenshot) -> Option<i32> {
-        // Scan x=5, y=50..500 for dark pixels; find the longest contiguous run.
-        let scan_x = 5u32;
-        let mut best_run_start = 0i32;
-        let mut best_run_len = 0usize;
-        let mut cur_run_start = 0i32;
-        let mut cur_run_len = 0usize;
-
-        for y in 50u32..500 {
-            let dark = ss.get_pixel(scan_x, y).map(|(r, _, _)| r < 100).unwrap_or(false);
-            if dark {
-                if cur_run_len == 0 {
-                    cur_run_start = y as i32;
-                }
-                cur_run_len += 1;
-            } else {
-                if cur_run_len > best_run_len {
-                    best_run_len = cur_run_len;
-                    best_run_start = cur_run_start;
-                }
-                cur_run_len = 0;
-            }
-        }
-        if cur_run_len > best_run_len {
-            best_run_len = cur_run_len;
-            best_run_start = cur_run_start;
-        }
-
-        if best_run_len >= 15 {
-            Some(best_run_start + best_run_len as i32 / 2)
-        } else {
-            None
-        }
-    }
-
-    /// Map a detected sidebar y-center to a PenTool (for the two pen slots we care about).
-    fn y_to_pen_tool(y: i32) -> PenTool {
-        if (y - Self::SIDEBAR_Y_PEN1).abs() < 25 {
-            PenTool::Ballpoint
-        } else if (y - Self::SIDEBAR_Y_PEN2).abs() < 25 {
-            PenTool::Fineliner
-        } else {
-            PenTool::Unknown
-        }
-    }
-
-    /// Take a fresh screenshot and detect palette state + active tool.
-    /// Returns (palette_open, tool).
-    async fn read_tool_state(&self) -> (bool, PenTool) {
-        let mut ss = match Screenshot::new() {
-            Ok(s) => s,
-            Err(_) => return (false, PenTool::Unknown),
-        };
-        if ss.take_screenshot().is_err() {
-            return (false, PenTool::Unknown);
-        }
-        let palette_open = Self::screenshot_palette_open(&ss);
-        let tool = if palette_open {
-            Self::screenshot_selected_tool_y(&ss)
-                .map(Self::y_to_pen_tool)
-                .unwrap_or(PenTool::Unknown)
-        } else {
-            PenTool::Unknown
-        };
-        info!("read_tool_state: palette_open={} → {:?}", palette_open, tool);
-        (palette_open, tool)
-    }
+    /// Black color icon within the settings panel.
+    const SETTINGS_COLOR_BLACK: (i32, i32) = (109, 478);
 
     /// Tap a point (touch_start + brief hold + touch_stop).
     async fn tap(&mut self, xy: (i32, i32)) -> Result<()> {
@@ -413,83 +328,54 @@ impl Touch {
         Ok(())
     }
 
-    /// Select fineliner pen with correct tip type, medium size, and black color.
-    ///
-    /// Robust algorithm that does not rely on knowing the current state:
-    /// 1. Open palette (toggle if closed)
-    /// 2. Tap ballpoint sidebar icon → guarantees ballpoint is now active
-    /// 3. Tap fineliner sidebar icon → selects it (since ballpoint was active, this just selects)
-    /// 4. Tap fineliner sidebar icon again → opens its settings (it's now active)
-    /// 5. Configure: fineliner tip, medium size, black color
-    /// 6. Close palette
-    pub async fn select_fineliner(&mut self) -> Result<PenTool> {
-        // Read current state so we can return the previous tool
-        let (palette_open, previous) = self.read_tool_state().await;
-
-        // Step 1: Open palette if not already open
-        if !palette_open {
-            self.tap(Self::PALETTE_BUTTON).await?;
-            sleep(Duration::from_millis(100)).await; // Extra delay after toggle
+    /// Detect whether the pen-tool sidebar slot is the currently highlighted
+    /// one, by checking whether its background is dark (pen mode active) or
+    /// light (some other tool, e.g. eraser, is active instead). Verified
+    /// against real screenshots in both states: pixel (5, 91) reads pure
+    /// black when pen mode is active, pure white when it is not.
+    async fn pen_slot_is_active(&self) -> bool {
+        let Ok(mut ss) = Screenshot::new() else {
+            return false;
+        };
+        if ss.take_screenshot().is_err() {
+            return false;
         }
+        ss.get_pixel(5, 91).map(|(r, _, _)| r < 128).unwrap_or(false)
+    }
 
-        let pen1 = (Self::SIDEBAR_X, Self::SIDEBAR_Y_PEN1);
-        let pen2 = (Self::SIDEBAR_X, Self::SIDEBAR_Y_PEN2);
-
-        // Step 2: Tap pen1 — guarantees pen1 is now the active tool
-        self.tap(pen1).await?;
-
-        // Step 3: Tap pen2 — selects it (pen1 was active, so this just switches)
-        self.tap(pen2).await?;
-
-        // Step 4: Tap pen2 again — opens its settings (pen2 is now active)
-        self.tap(pen2).await?;
-        sleep(Duration::from_millis(100)).await; // Extra delay for settings panel animation
-
-        // Step 5: Configure thin size (skip tip type — tapping it closes the settings panel)
+    /// Select a specific pen type, forcing thin stroke width and black
+    /// color, using only verified RM2 coordinates. Never taps the eraser
+    /// icon or any unverified location.
+    async fn select_pen_type(&mut self, type_xy: (i32, i32)) -> Result<()> {
+        if !self.pen_slot_is_active().await {
+            // Some other tool (eraser, text, select, ...) is active: one
+            // tap here reactivates pen mode (recalling the last-used pen
+            // type) without opening the settings panel, so a second tap
+            // is needed to actually open it.
+            self.tap(Self::PEN_SLOT).await?;
+        }
+        // Pen mode is active either way now: this tap opens its settings panel.
+        self.tap(Self::PEN_SLOT).await?;
+        self.tap(type_xy).await?;
         self.tap(Self::SETTINGS_SIZE_THIN).await?;
-
-        // Step 6: Configure black color
         self.tap(Self::SETTINGS_COLOR_BLACK).await?;
-
-        // Step 8: Close palette
-        self.tap(Self::PALETTE_BUTTON).await?;
-
-        info!("select_fineliner: done, previous={:?}", previous);
-        Ok(previous)
+        // Close the panel.
+        self.tap(Self::PEN_SLOT).await?;
+        Ok(())
     }
 
-    /// Switch to the given pen tool. Returns the previously active tool so caller can restore.
-    /// Uses sidebar icons for reliable tool selection.
-    pub async fn switch_to_tool(&mut self, target: PenTool) -> Result<PenTool> {
-        let (palette_open, current_tool) = self.read_tool_state().await;
-        let previous = if palette_open { PenTool::Unknown } else { current_tool };
-
-        match target {
-            PenTool::Fineliner => {
-                return self.select_fineliner().await;
-            }
-            PenTool::Ballpoint => {
-                // Open palette, tap pen1 sidebar icon, close palette
-                if !palette_open {
-                    self.tap(Self::PALETTE_BUTTON).await?;
-                    sleep(Duration::from_millis(100)).await;
-                }
-                self.tap((Self::SIDEBAR_X, Self::SIDEBAR_Y_PEN1)).await?;
-                self.tap(Self::PALETTE_BUTTON).await?;
-            }
-            PenTool::Unknown => {}
-        }
-
-        info!("switch_to_tool: {:?} → {:?}", previous, target);
-        Ok(previous)
+    /// Select the calligraphy pen (thin, black) — used for the diary's
+    /// cursive handwriting.
+    pub async fn select_calligraphy_pen(&mut self) -> Result<()> {
+        self.select_pen_type(Self::PEN_TYPE_CALLIGRAPHY).await?;
+        info!("select_calligraphy_pen: done");
+        Ok(())
     }
 
-    /// Restore a previously saved tool (e.g. after drawing is done).
-    pub async fn restore_tool(&mut self, previous: PenTool) -> Result<()> {
-        if previous == PenTool::Unknown || previous == PenTool::Fineliner {
-            return Ok(()); // Nothing to restore or already on fineliner
-        }
-        self.switch_to_tool(previous).await?;
+    /// Select the fineliner pen (thin, black) — used for draw_svg.
+    pub async fn select_fineliner(&mut self) -> Result<()> {
+        self.select_pen_type(Self::PEN_TYPE_FINELINER).await?;
+        info!("select_fineliner: done");
         Ok(())
     }
 
