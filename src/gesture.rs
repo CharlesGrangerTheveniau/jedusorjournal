@@ -1,16 +1,25 @@
-//! Double-tap gesture detection: the user ends a question with two quick,
-//! adjacent taps of the pen (like adding an extra period: ".."), which
-//! triggers the diary to answer.
+//! Triple-tap gesture detection: the user ends a question with three quick,
+//! adjacent taps of the pen (like an ellipsis: "…"), which triggers the
+//! diary to answer.
+//!
+//! Originally a double-tap (two taps), but real on-device testing showed
+//! that two small, quick, closely-spaced taps are geometrically
+//! indistinguishable from incidental marks in normal handwriting — French
+//! accent marks in particular are exactly this shape, and one accidentally
+//! paired with a nearby dot fired the trigger mid-sentence, sending an
+//! incomplete question to the LLM. Three consecutive taps all pairwise
+//! close in time and space is a much rarer accidental coincidence while
+//! remaining a fast, deliberate gesture to perform on purpose.
 
 #[derive(Debug, Clone, Copy)]
-pub struct DoubleTapConfig {
+pub struct TripleTapConfig {
     pub max_tap_duration_ms: u64,
     pub max_tap_bbox_px: f32,
     pub max_pair_gap_ms: u64,
     pub max_pair_distance_px: f32,
 }
 
-impl Default for DoubleTapConfig {
+impl Default for TripleTapConfig {
     fn default() -> Self {
         Self {
             max_tap_duration_ms: 400,
@@ -25,7 +34,7 @@ impl Default for DoubleTapConfig {
 /// is a "tap": a small, quick, nearly-stationary mark like a period —
 /// clearly smaller and faster than any letter (verified on real device
 /// data: even the smallest tested letters were 20px+ and 300ms+).
-pub fn is_tap(points: &[(f32, f32)], duration_ms: u64, config: &DoubleTapConfig) -> bool {
+pub fn is_tap(points: &[(f32, f32)], duration_ms: u64, config: &TripleTapConfig) -> bool {
     if points.is_empty() {
         return false;
     }
@@ -37,10 +46,10 @@ pub fn is_tap(points: &[(f32, f32)], duration_ms: u64, config: &DoubleTapConfig)
     max_dim <= config.max_tap_bbox_px
 }
 
-/// Detect whether two taps (each already confirmed via `is_tap`) form a
-/// deliberate double-tap trigger: close together in time and adjacent in
-/// space, like two dots placed side by side at the end of a sentence.
-pub fn is_double_tap(first_center: (f32, f32), second_center: (f32, f32), gap_ms: u64, config: &DoubleTapConfig) -> bool {
+/// Detect whether two taps (each already confirmed via `is_tap`) are close
+/// enough in time and space to be consecutive members of the same
+/// deliberate tap sequence.
+pub fn is_tap_pair(first_center: (f32, f32), second_center: (f32, f32), gap_ms: u64, config: &TripleTapConfig) -> bool {
     if gap_ms > config.max_pair_gap_ms {
         return false;
     }
@@ -88,43 +97,43 @@ mod tests {
     #[test]
     fn detects_a_quick_small_tap() {
         let points = synthetic_tap(100.0, 100.0, 3.0, 6);
-        assert!(is_tap(&points, 150, &DoubleTapConfig::default()));
+        assert!(is_tap(&points, 150, &TripleTapConfig::default()));
     }
 
     #[test]
     fn rejects_a_tap_that_is_too_big() {
         // Bigger than any letter observed in real calibration data (20px+).
         let points = synthetic_tap(100.0, 100.0, 15.0, 6);
-        assert!(!is_tap(&points, 150, &DoubleTapConfig::default()));
+        assert!(!is_tap(&points, 150, &TripleTapConfig::default()));
     }
 
     #[test]
     fn rejects_a_tap_drawn_too_slowly() {
         let points = synthetic_tap(100.0, 100.0, 3.0, 6);
-        assert!(!is_tap(&points, 600, &DoubleTapConfig::default()));
+        assert!(!is_tap(&points, 600, &TripleTapConfig::default()));
     }
 
     #[test]
     fn rejects_an_empty_stroke() {
-        assert!(!is_tap(&[], 100, &DoubleTapConfig::default()));
+        assert!(!is_tap(&[], 100, &TripleTapConfig::default()));
     }
 
     #[test]
     fn accepts_two_adjacent_taps_close_in_time() {
-        let config = DoubleTapConfig::default();
-        assert!(is_double_tap((100.0, 100.0), (110.0, 102.0), 500, &config));
+        let config = TripleTapConfig::default();
+        assert!(is_tap_pair((100.0, 100.0), (110.0, 102.0), 500, &config));
     }
 
     #[test]
     fn rejects_two_taps_too_far_apart_in_time() {
-        let config = DoubleTapConfig::default();
-        assert!(!is_double_tap((100.0, 100.0), (110.0, 102.0), 2000, &config));
+        let config = TripleTapConfig::default();
+        assert!(!is_tap_pair((100.0, 100.0), (110.0, 102.0), 2000, &config));
     }
 
     #[test]
     fn rejects_two_taps_too_far_apart_in_space() {
-        let config = DoubleTapConfig::default();
-        assert!(!is_double_tap((100.0, 100.0), (300.0, 100.0), 500, &config));
+        let config = TripleTapConfig::default();
+        assert!(!is_tap_pair((100.0, 100.0), (300.0, 100.0), 500, &config));
     }
 
     #[test]
@@ -139,6 +148,8 @@ mod tests {
 use anyhow::Result;
 use evdev::{Device, EventStream, EventType as EvdevEventType};
 use log::info;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cancellation::GhostwriterCancellation;
@@ -179,15 +190,27 @@ fn input_to_virtual((x, y): (f32, f32), device_model: DeviceModel) -> (f32, f32)
     }
 }
 
-pub struct DoubleTapWatcher {
+/// Shared flag the drawing code sets to `true` for the duration of a
+/// write_cursive drawing pass, so the gesture watcher can ignore its own
+/// simulated pen events instead of risking a false trigger. Confirmed on
+/// real hardware: the diary's own simulated strokes appear on the same
+/// pen input device the watcher reads, indistinguishable from real user
+/// input by the watcher alone — during one drawing pass, a burst of
+/// self-generated strokes accidentally paired into a spurious trigger
+/// (caught harmlessly by the existing "ignore triggers received during
+/// processing" drain, but a real gap worth closing here directly).
+pub type DrawingInProgress = Arc<AtomicBool>;
+
+pub struct TripleTapWatcher {
     event_stream: Option<EventStream>,
     device_model: DeviceModel,
-    config: DoubleTapConfig,
+    config: TripleTapConfig,
     log_gestures: bool,
+    drawing_in_progress: DrawingInProgress,
 }
 
-impl DoubleTapWatcher {
-    pub fn new(no_gesture: bool, config: DoubleTapConfig, log_gestures: bool) -> Self {
+impl TripleTapWatcher {
+    pub fn new(no_gesture: bool, config: TripleTapConfig, log_gestures: bool, drawing_in_progress: DrawingInProgress) -> Self {
         let device_model = DeviceModel::detect();
         let pen_input_device = match device_model {
             DeviceModel::RemarkablePaperPro => "/dev/input/event2",
@@ -203,15 +226,19 @@ impl DoubleTapWatcher {
             device_model,
             config,
             log_gestures,
+            drawing_in_progress,
         }
     }
 
-    /// Wait until two adjacent, quick taps are drawn on the pen digitizer
-    /// (like ".."), returning the midpoint between them in virtual screen
-    /// coordinates. Any non-tap stroke (normal writing) clears a pending
-    /// first tap, so only genuinely adjacent taps — with nothing else drawn
-    /// in between — count as a pair.
-    pub async fn wait_for_double_tap(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
+    /// Wait until three consecutive, pairwise-adjacent, quick taps are
+    /// drawn on the pen digitizer (like "…"), returning the centroid of
+    /// the three in virtual screen coordinates. Any non-tap stroke (normal
+    /// writing) clears the whole in-progress chain, so only a genuinely
+    /// uninterrupted run of three taps counts — a tap that doesn't pair
+    /// with the previous one restarts the chain from itself rather than
+    /// discarding it entirely, so "tap, [pause], tap, tap" still fires if
+    /// the last two are close enough.
+    pub async fn wait_for_triple_tap(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
         let Some(stream) = &mut self.event_stream else {
             // No-gesture mode: block until cancelled, like Touch's no-stream path.
             loop {
@@ -226,7 +253,8 @@ impl DoubleTapWatcher {
         let mut cur_x = 0.0f32;
         let mut cur_y = 0.0f32;
         let mut stroke_start: Option<Instant> = None;
-        let mut pending_tap: Option<((f32, f32), Instant)> = None;
+        // Taps confirmed so far in the current chain (0, 1, or 2 entries).
+        let mut chain: Vec<((f32, f32), Instant)> = Vec::new();
 
         loop {
             let event = tokio::select! {
@@ -237,6 +265,18 @@ impl DoubleTapWatcher {
                 } => return Err(anyhow::anyhow!("Gesture waiting cancelled")),
                 ev = stream.next_event() => ev?,
             };
+
+            if self.drawing_in_progress.load(Ordering::Relaxed) {
+                // The diary is currently drawing its own answer, which
+                // generates real pen events on this same device. Ignore
+                // everything until drawing finishes, and drop any
+                // in-progress stroke/chain state so we don't misinterpret
+                // the tail of a self-generated stroke once we resume.
+                points.clear();
+                stroke_start = None;
+                chain.clear();
+                continue;
+            }
 
             match (event.event_type(), event.code(), event.value()) {
                 (EvdevEventType::KEY, BTN_TOUCH, 1) => {
@@ -265,44 +305,50 @@ impl DoubleTapWatcher {
                     }
 
                     if !tap {
-                        // Anything that isn't a tap clears a pending first
-                        // dot — a double-tap trigger requires the two taps
-                        // to be adjacent, with nothing else drawn between them.
-                        pending_tap = None;
+                        // Anything that isn't a tap clears the whole chain — a
+                        // triple-tap trigger requires three uninterrupted taps,
+                        // with nothing else drawn in between.
+                        chain.clear();
                         continue;
                     }
 
                     let this_center = bbox_center(&virtual_points);
-                    match pending_tap.take() {
-                        Some((prev_center, prev_time)) => {
+                    let this_time = Instant::now();
+
+                    let pairs_with_last = chain
+                        .last()
+                        .map(|&(prev_center, prev_time)| {
                             let gap_ms = prev_time.elapsed().as_millis() as u64;
                             let dx = this_center.0 - prev_center.0;
                             let dy = this_center.1 - prev_center.1;
                             let dist = (dx * dx + dy * dy).sqrt();
-                            let paired = is_double_tap(prev_center, this_center, gap_ms, &self.config);
+                            let paired = is_tap_pair(prev_center, this_center, gap_ms, &self.config);
                             if self.log_gestures {
                                 info!(
-                                    "tap pair check: gap={}ms, dist={:.1}px => {}",
+                                    "tap pair check: chain_len={}, gap={}ms, dist={:.1}px => {}",
+                                    chain.len(),
                                     gap_ms,
                                     dist,
                                     if paired { "PAIRED" } else { "not paired" }
                                 );
                             }
-                            if paired {
-                                let anchor = (
-                                    (prev_center.0 + this_center.0) / 2.0,
-                                    (prev_center.1 + this_center.1) / 2.0,
-                                );
-                                info!("Double-tap detected at ({:.1}, {:.1})", anchor.0, anchor.1);
-                                return Ok(anchor);
-                            }
-                            // Too far apart in time/space to pair — this tap
-                            // becomes the new pending first dot instead.
-                            pending_tap = Some((this_center, Instant::now()));
+                            paired
+                        })
+                        .unwrap_or(false);
+
+                    if pairs_with_last {
+                        chain.push((this_center, this_time));
+                        if chain.len() == 3 {
+                            let (sum_x, sum_y) = chain.iter().fold((0.0, 0.0), |(sx, sy), &((x, y), _)| (sx + x, sy + y));
+                            let anchor = (sum_x / 3.0, sum_y / 3.0);
+                            info!("Triple-tap detected at ({:.1}, {:.1})", anchor.0, anchor.1);
+                            return Ok(anchor);
                         }
-                        None => {
-                            pending_tap = Some((this_center, Instant::now()));
-                        }
+                    } else {
+                        // Didn't pair with the chain's last tap (or chain was
+                        // empty) — start a fresh chain from this tap.
+                        chain.clear();
+                        chain.push((this_center, this_time));
                     }
                 }
                 (EvdevEventType::SYNCHRONIZATION, _, _) => {

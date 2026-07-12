@@ -20,9 +20,9 @@ use crate::touch::{Touch, TriggerCorner};
 pub enum TriggerEvent {
     /// User touched the trigger corner
     UserTouch,
-    /// User drew the double-tap gesture; carries the anchor point (virtual
+    /// User drew the triple-tap gesture; carries the anchor point (virtual
     /// px) to place the answer below.
-    DoubleTapGesture { anchor_x: f32, anchor_y: f32 },
+    TripleTapGesture { anchor_x: f32, anchor_y: f32 },
     /// Trigger via web API (for testing/simulation)
     WebTrigger,
 }
@@ -173,21 +173,21 @@ pub async fn trigger_task(
     Ok(())
 }
 
-/// Task that waits for the double-tap gesture and notifies the
+/// Task that waits for the triple-tap gesture and notifies the
 /// coordinator, running alongside `trigger_task`'s corner-tap watcher.
 pub async fn gesture_trigger_task(
-    mut watcher: crate::gesture::DoubleTapWatcher,
+    mut watcher: crate::gesture::TripleTapWatcher,
     trigger_tx: mpsc::Sender<TriggerEvent>,
     cancellation: Arc<GhostwriterCancellation>,
     gesture_anchor: GestureAnchor,
 ) -> Result<()> {
     info!("Gesture trigger task starting");
     loop {
-        match watcher.wait_for_double_tap(&cancellation).await {
+        match watcher.wait_for_triple_tap(&cancellation).await {
             Ok((anchor_x, anchor_y)) => {
-                info!("Gesture trigger task: double-tap detected at ({}, {})", anchor_x, anchor_y);
+                info!("Gesture trigger task: triple-tap detected at ({}, {})", anchor_x, anchor_y);
                 *gesture_anchor.lock().await = Some((anchor_x, anchor_y));
-                if trigger_tx.send(TriggerEvent::DoubleTapGesture { anchor_x, anchor_y }).await.is_err() {
+                if trigger_tx.send(TriggerEvent::TripleTapGesture { anchor_x, anchor_y }).await.is_err() {
                     info!("Trigger receiver dropped, exiting gesture trigger task");
                     break;
                 }
@@ -197,7 +197,7 @@ pub async fn gesture_trigger_task(
                     info!("Gesture trigger task: cancelled (likely config change)");
                     return Ok(());
                 }
-                info!("Gesture trigger task: error waiting for double-tap: {}", e);
+                info!("Gesture trigger task: error waiting for triple-tap: {}", e);
                 return Err(e);
             }
         }

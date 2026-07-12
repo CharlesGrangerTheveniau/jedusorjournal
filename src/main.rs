@@ -3,6 +3,7 @@ use clap::Parser;
 use dotenv::dotenv;
 use log::info;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
@@ -454,8 +455,21 @@ async fn run_ghostwriter_loop(
     // write_cursive tool and cleared by trigger_task on a corner tap.
     let gesture_anchor: coordinator::GestureAnchor = Arc::new(TokioMutex::new(None));
 
+    // Shared flag so the gesture watcher can ignore the diary's own simulated
+    // pen strokes while write_cursive is drawing (they loop back onto the same
+    // input device the watcher reads from and would otherwise self-trigger).
+    let drawing_in_progress: ghostwriter::gesture::DrawingInProgress = Arc::new(AtomicBool::new(false));
+
     // Register tools
-    register_tools(&mut engine, Arc::clone(&keyboard), Arc::clone(&pen), Arc::clone(&touch), &config, &gesture_anchor)?;
+    register_tools(
+        &mut engine,
+        Arc::clone(&keyboard),
+        Arc::clone(&pen),
+        Arc::clone(&touch),
+        &config,
+        &gesture_anchor,
+        Arc::clone(&drawing_in_progress),
+    )?;
 
     let engine = Arc::new(TokioMutex::new(engine));
 
@@ -473,13 +487,19 @@ async fn run_ghostwriter_loop(
         let trigger_tx = channels.trigger_tx.clone();
         let cancellation = Arc::clone(&cancellation);
         let gesture_anchor = Arc::clone(&gesture_anchor);
-        let double_tap_config = ghostwriter::gesture::DoubleTapConfig {
+        let drawing_in_progress = Arc::clone(&drawing_in_progress);
+        let triple_tap_config = ghostwriter::gesture::TripleTapConfig {
             max_tap_duration_ms: config.gesture_max_tap_duration_ms,
             max_tap_bbox_px: config.gesture_max_tap_bbox_px,
             max_pair_gap_ms: config.gesture_max_pair_gap_ms,
             max_pair_distance_px: config.gesture_max_pair_distance_px,
         };
-        let watcher = ghostwriter::gesture::DoubleTapWatcher::new(config.no_gesture || config.no_draw, double_tap_config, config.log_gestures);
+        let watcher = ghostwriter::gesture::TripleTapWatcher::new(
+            config.no_gesture || config.no_draw,
+            triple_tap_config,
+            config.log_gestures,
+            drawing_in_progress,
+        );
         tokio::spawn(async move { coordinator::gesture_trigger_task(watcher, trigger_tx, cancellation, gesture_anchor).await })
     };
 
@@ -629,6 +649,7 @@ fn register_tools(
     _touch: Arc<TokioRwLock<Touch>>,
     config: &Config,
     gesture_anchor: &coordinator::GestureAnchor,
+    drawing_in_progress: ghostwriter::gesture::DrawingInProgress,
 ) -> Result<()> {
     use serde_json::Value as json;
 
@@ -757,7 +778,13 @@ fn register_tools(
                     // state at all.
                     let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
                     let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
-                    if let Err(e) = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed) {
+                    // Suspend the gesture watcher while drawing: our own simulated
+                    // pen strokes loop back onto the same input device it reads
+                    // from and would otherwise be mistaken for real taps.
+                    drawing_in_progress.store(true, Ordering::Relaxed);
+                    let result = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed);
+                    drawing_in_progress.store(false, Ordering::Relaxed);
+                    if let Err(e) = result {
                         log::error!("Failed to write cursive: {}", e);
                     }
                 }
