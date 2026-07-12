@@ -13,7 +13,7 @@ use crate::llm_engine::{LLMEngine, ModelExecutionStatus};
 use crate::screenshot::Screenshot;
 use crate::segmenter::ImageAnalyzer;
 use crate::simulation::SimulationConfig;
-use crate::touch::Touch;
+use crate::touch::{Touch, TriggerCorner};
 
 /// Events that can trigger AI processing
 #[derive(Debug, Clone)]
@@ -360,9 +360,18 @@ pub async fn processing_task(
         return Ok(());
     }
 
-    // Tap middle bottom to position cursor for text input (before showing "Thinking")
-    if let Err(e) = touch.write().await.tap_middle_bottom().await {
-        info!("Failed to tap middle bottom: {}", e);
+    // Tap middle bottom to position cursor for text input (before showing "Thinking").
+    // Use a fresh Touch instance rather than the shared `touch` RwLock: when the
+    // trigger came from the gesture watcher (not a corner tap), trigger_task is
+    // still holding that lock indefinitely inside wait_for_trigger, waiting for
+    // a corner tap that may never come — acquiring the shared lock here would
+    // deadlock. This mirrors the same pattern draw_svg's tool registration
+    // already uses for exactly this reason.
+    if !config.is_test_mode() {
+        let trigger_corner = TriggerCorner::from_string(&config.trigger_corner).unwrap_or(TriggerCorner::UpperRight);
+        if let Err(e) = Touch::new(config.no_draw, trigger_corner).tap_middle_bottom().await {
+            info!("Failed to tap middle bottom: {}", e);
+        }
     }
 
     // Update progress: building context
