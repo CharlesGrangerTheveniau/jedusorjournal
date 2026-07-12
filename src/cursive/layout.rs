@@ -28,7 +28,7 @@ impl Default for LayoutConfig {
         Self {
             x_height_px: 28.0,
             line_spacing_mult: 2.2,
-            word_spacing_mult: 0.6,
+            word_spacing_mult: 1.2,
         }
     }
 }

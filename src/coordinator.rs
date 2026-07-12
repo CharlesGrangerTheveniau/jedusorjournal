@@ -277,9 +277,9 @@ pub async fn progress_task(
                         }
                         ProgressState::LlmState(ModelExecutionStatus::BuildingContext) => {
                             info!("Progress: Building context...");
-                            if let Ok(mut kb) = keyboard.lock() {
-                                let _ = kb.progress("Thinking");
-                            }
+                            // No label — just the dots (added below, ticking every
+                            // 500ms during LlmProcessing). A visible "Thinking" word
+                            // breaks the diary's fiction more than a bare "..." does.
                         }
                         ProgressState::LlmState(ModelExecutionStatus::LlmProcessing) => {
                             info!("Progress: Thinking...");

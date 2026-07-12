@@ -716,7 +716,6 @@ fn register_tools(
     // Register write_cursive tool
     if !config.no_svg {
         let no_draw = config.no_draw;
-        let test_mode = config.is_test_mode();
         let pen_clone = Arc::clone(&pen);
         let cursive_config = ghostwriter::cursive::CursiveConfig {
             layout: ghostwriter::cursive::LayoutConfig {
@@ -748,22 +747,14 @@ fn register_tools(
                 });
 
                 if !no_draw {
-                    // Switch to the calligraphy pen before drawing. Use a fresh Touch
-                    // instance to avoid deadlock with trigger_task, which holds the
-                    // shared touch RwLock indefinitely while waiting for a corner-tap
-                    // trigger. The tool is deliberately left on calligraphy afterward
-                    // (no restore) — see src/touch.rs's tool-palette-helpers comment
-                    // for why: restoring an arbitrary previous tool would need its own
-                    // verified coordinates per tool, which is exactly the kind of
-                    // unverified blind-tap risk that caused real content loss here.
-                    if !test_mode {
-                        tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let _ = Touch::new(false, TriggerCorner::UpperRight).select_calligraphy_pen().await;
-                            })
-                        });
-                    }
-
+                    // Deliberately does NOT switch pen tool before drawing — draws
+                    // with whatever tool the user currently has selected. An earlier
+                    // version called select_calligraphy_pen() here, but that left the
+                    // tool changed after every answer (no safe way to restore an
+                    // arbitrary previous tool — see src/touch.rs's tool-palette-helpers
+                    // comment), which surprised the user's own subsequent writing.
+                    // Trading pen-style consistency for not touching the user's tool
+                    // state at all.
                     let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
                     let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
                     if let Err(e) = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed) {
