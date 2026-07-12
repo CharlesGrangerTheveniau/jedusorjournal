@@ -138,7 +138,7 @@ pub struct Args {
     diary_notebook: Option<String>,
 
     /// Cursive x-height in virtual pixels (glyph size)
-    #[arg(long, default_value = "28.0")]
+    #[arg(long, default_value = "14.0")]
     cursive_x_height_px: f32,
 
     /// Pause between words while writing cursive, in milliseconds

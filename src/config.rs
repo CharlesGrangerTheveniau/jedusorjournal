@@ -78,7 +78,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             trigger_corner: "UR".to_string(),
             diary_notebook: None,
-            cursive_x_height_px: 28.0,
+            cursive_x_height_px: 14.0,
             cursive_word_gap_ms: 220,
             gesture_max_tap_duration_ms: 400,
             gesture_max_tap_bbox_px: 12.0,

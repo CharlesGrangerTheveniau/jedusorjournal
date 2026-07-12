@@ -316,6 +316,10 @@ impl Touch {
     /// Thin stroke-width icon within the settings panel.
     const SETTINGS_SIZE_THIN: (i32, i32) = (109, 380);
 
+    /// Medium stroke-width icon within the settings panel. Verified:
+    /// tapping this shows the panel header "Medium" (was "Thin").
+    const SETTINGS_SIZE_MEDIUM: (i32, i32) = (170, 380);
+
     /// Black color icon within the settings panel.
     const SETTINGS_COLOR_BLACK: (i32, i32) = (109, 478);
 
@@ -343,10 +347,10 @@ impl Touch {
         ss.get_pixel(5, 91).map(|(r, _, _)| r < 128).unwrap_or(false)
     }
 
-    /// Select a specific pen type, forcing thin stroke width and black
-    /// color, using only verified RM2 coordinates. Never taps the eraser
-    /// icon or any unverified location.
-    async fn select_pen_type(&mut self, type_xy: (i32, i32)) -> Result<()> {
+    /// Select a specific pen type and stroke width (color is always
+    /// forced to black), using only verified RM2 coordinates. Never taps
+    /// the eraser icon or any unverified location.
+    async fn select_pen_type(&mut self, type_xy: (i32, i32), size_xy: (i32, i32)) -> Result<()> {
         if !self.pen_slot_is_active().await {
             // Some other tool (eraser, text, select, ...) is active: one
             // tap here reactivates pen mode (recalling the last-used pen
@@ -357,24 +361,24 @@ impl Touch {
         // Pen mode is active either way now: this tap opens its settings panel.
         self.tap(Self::PEN_SLOT).await?;
         self.tap(type_xy).await?;
-        self.tap(Self::SETTINGS_SIZE_THIN).await?;
+        self.tap(size_xy).await?;
         self.tap(Self::SETTINGS_COLOR_BLACK).await?;
         // Close the panel.
         self.tap(Self::PEN_SLOT).await?;
         Ok(())
     }
 
-    /// Select the calligraphy pen (thin, black) — used for the diary's
+    /// Select the calligraphy pen (medium, black) — used for the diary's
     /// cursive handwriting.
     pub async fn select_calligraphy_pen(&mut self) -> Result<()> {
-        self.select_pen_type(Self::PEN_TYPE_CALLIGRAPHY).await?;
+        self.select_pen_type(Self::PEN_TYPE_CALLIGRAPHY, Self::SETTINGS_SIZE_MEDIUM).await?;
         info!("select_calligraphy_pen: done");
         Ok(())
     }
 
     /// Select the fineliner pen (thin, black) — used for draw_svg.
     pub async fn select_fineliner(&mut self) -> Result<()> {
-        self.select_pen_type(Self::PEN_TYPE_FINELINER).await?;
+        self.select_pen_type(Self::PEN_TYPE_FINELINER, Self::SETTINGS_SIZE_THIN).await?;
         info!("select_fineliner: done");
         Ok(())
     }
