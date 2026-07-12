@@ -138,7 +138,7 @@ mod tests {
 
 use anyhow::Result;
 use evdev::{Device, EventStream, EventType as EvdevEventType};
-use log::{debug, info};
+use log::info;
 use std::time::Instant;
 
 use crate::cancellation::GhostwriterCancellation;
@@ -276,7 +276,19 @@ impl DoubleTapWatcher {
                     match pending_tap.take() {
                         Some((prev_center, prev_time)) => {
                             let gap_ms = prev_time.elapsed().as_millis() as u64;
-                            if is_double_tap(prev_center, this_center, gap_ms, &self.config) {
+                            let dx = this_center.0 - prev_center.0;
+                            let dy = this_center.1 - prev_center.1;
+                            let dist = (dx * dx + dy * dy).sqrt();
+                            let paired = is_double_tap(prev_center, this_center, gap_ms, &self.config);
+                            if self.log_gestures {
+                                info!(
+                                    "tap pair check: gap={}ms, dist={:.1}px => {}",
+                                    gap_ms,
+                                    dist,
+                                    if paired { "PAIRED" } else { "not paired" }
+                                );
+                            }
+                            if paired {
                                 let anchor = (
                                     (prev_center.0 + this_center.0) / 2.0,
                                     (prev_center.1 + this_center.1) / 2.0,
@@ -286,7 +298,6 @@ impl DoubleTapWatcher {
                             }
                             // Too far apart in time/space to pair — this tap
                             // becomes the new pending first dot instead.
-                            debug!("tap did not pair with previous tap; treating as new first tap");
                             pending_tap = Some((this_center, Instant::now()));
                         }
                         None => {
