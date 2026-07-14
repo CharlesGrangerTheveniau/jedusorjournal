@@ -766,9 +766,29 @@ fn register_tools(
                 };
                 let x = arguments["x"].as_i64().unwrap_or(60) as f32;
                 let width = arguments["width"].as_i64().unwrap_or(650) as f32;
-                let y = arguments["y"].as_i64().map(|v| v as f32).unwrap_or_else(|| {
-                    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { gesture_anchor.lock().await.map(|(_, ay)| ay).unwrap_or(400.0) }))
-                });
+                // Ignore the model's own y guess whenever we have a gesture anchor:
+                // it's measured directly from the real triple-tap position (ground
+                // truth), while the model's pixel-level guess from the screenshot
+                // has proven unreliable on real hardware — answers landed well
+                // above their own question, and each new answer landed above the
+                // previous one instead of below it. The anchor sits on the same
+                // line as the end of the question (the taps are drawn right after
+                // it), so offset one line down to start the answer on a fresh line
+                // rather than overlapping the question's own line.
+                let anchor = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { *gesture_anchor.lock().await }));
+                let y = match anchor {
+                    Some((_, anchor_y)) => anchor_y + cursive_config.layout.x_height_px * cursive_config.layout.line_spacing_mult,
+                    None => arguments["y"].as_i64().map(|v| v as f32).unwrap_or(400.0),
+                };
+                info!(
+                    "write_cursive: placing at x={:.1}, y={:.1} (model proposed x={:?}, y={:?}; anchor={:?}), text={:?}",
+                    x,
+                    y,
+                    arguments["x"].as_i64(),
+                    arguments["y"].as_i64(),
+                    anchor,
+                    text
+                );
 
                 if !no_draw {
                     // Deliberately does NOT switch pen tool before drawing — draws
