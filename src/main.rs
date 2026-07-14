@@ -680,6 +680,7 @@ fn register_tools(
         let keyboard_clone = Arc::clone(&keyboard);
         let pen_clone = Arc::clone(&pen);
         let test_mode = config.is_test_mode();
+        let drawing_in_progress = Arc::clone(&drawing_in_progress);
 
         let tool_config_draw_svg = load_config("tool_draw_svg.json");
         engine.register_tool(
@@ -714,7 +715,15 @@ fn register_tools(
 
                 let mut keyboard = lock!(keyboard_clone);
                 let mut pen = lock!(pen_clone);
-                if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
+                // Suspend the idle watcher for the same reason write_cursive
+                // does: these strokes go out on the pen input device the
+                // watcher reads, and would otherwise count as fresh user
+                // writing — guaranteeing a spurious re-trigger one idle-delay
+                // after any draw_svg answer.
+                drawing_in_progress.store(true, Ordering::Relaxed);
+                let result = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw);
+                drawing_in_progress.store(false, Ordering::Relaxed);
+                if let Err(e) = result {
                     log::error!("Failed to draw SVG: {}", e);
                 }
                 drop(keyboard);

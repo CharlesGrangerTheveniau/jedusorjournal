@@ -25,6 +25,7 @@ use crate::device::DeviceModel;
 
 const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
+const BTN_TOOL_RUBBER: u16 = 321;
 const BTN_TOUCH: u16 = 330;
 
 // Duplicated from pen.rs / touch.rs by existing project convention (each
@@ -153,10 +154,21 @@ impl IdleWatcher {
         let mut cur_x = 0.0f32;
         let mut cur_y = 0.0f32;
         let mut in_stroke = false;
+        // Whether the pen's eraser end is currently the active tool. Eraser
+        // strokes still reset the idle clock (don't fire mid-erase) but do
+        // NOT count as new content — erasing after an answer shouldn't
+        // re-trigger an answer to the already-answered page.
+        let mut rubber_active = false;
         // Set on every genuine stroke-end; cleared once we've fired (or once
         // a drawing pass finishes, so the diary's own strokes never count).
         let mut last_activity: Option<Instant> = None;
         let mut has_new_content = false;
+        // Where the last real pen stroke ENDED, captured at stroke-end time.
+        // Deliberately not read from cur_x/cur_y at fire time: the digitizer
+        // keeps reporting ABS coordinates while the pen merely hovers, so by
+        // the time the idle timer fires the live position may have drifted
+        // to wherever the user is hovering, not where they stopped writing.
+        let mut last_stroke_end: Option<(f32, f32)> = None;
         let mut was_drawing = false;
 
         enum Woke {
@@ -187,6 +199,7 @@ impl IdleWatcher {
                         // don't let that count as "new content" to answer again.
                         has_new_content = false;
                         last_activity = None;
+                        last_stroke_end = None;
                         in_stroke = false;
                     }
                     was_drawing = now_drawing;
@@ -194,7 +207,7 @@ impl IdleWatcher {
                     if !now_drawing && has_new_content {
                         if let Some(t) = last_activity {
                             if t.elapsed() >= Duration::from_millis(self.config.idle_delay_ms) {
-                                let anchor = input_to_virtual((cur_x, cur_y), self.device_model);
+                                let anchor = last_stroke_end.unwrap_or_else(|| input_to_virtual((cur_x, cur_y), self.device_model));
                                 info!("Idle trigger fired at ({:.1}, {:.1}) after {}ms of inactivity", anchor.0, anchor.1, self.config.idle_delay_ms);
                                 return Ok(anchor);
                             }
@@ -202,7 +215,19 @@ impl IdleWatcher {
                     }
                     continue;
                 }
-                Woke::Event(ev) => ev?,
+                Woke::Event(Ok(ev)) => ev,
+                Woke::Event(Err(e)) => {
+                    // Don't let a transient read error kill the trigger task
+                    // for the rest of the process lifetime — the pen fd has
+                    // already proven flaky on this hardware (see
+                    // `reopen_stream`), so treat errors the same way: drop
+                    // the fd, reopen, carry on.
+                    warn!("Idle watcher: pen input stream error: {} — reopening stream", e);
+                    self.reopen_stream();
+                    in_stroke = false;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
             };
 
             if self.drawing_in_progress.load(Ordering::Relaxed) {
@@ -216,6 +241,9 @@ impl IdleWatcher {
             was_drawing = false;
 
             match (event.event_type(), event.code(), event.value()) {
+                (EvdevEventType::KEY, BTN_TOOL_RUBBER, v) => {
+                    rubber_active = v == 1;
+                }
                 (EvdevEventType::KEY, BTN_TOUCH, 1) => {
                     in_stroke = true;
                 }
@@ -224,11 +252,22 @@ impl IdleWatcher {
                 (EvdevEventType::KEY, BTN_TOUCH, 0) => {
                     if in_stroke {
                         in_stroke = false;
-                        has_new_content = true;
+                        // Any stroke (pen or eraser) resets the idle clock so
+                        // we never fire mid-activity, but only pen strokes
+                        // count as content worth answering.
                         last_activity = Some(Instant::now());
+                        if !rubber_active {
+                            has_new_content = true;
+                            last_stroke_end = Some(input_to_virtual((cur_x, cur_y), self.device_model));
+                        }
                         if self.log_gestures {
                             let (vx, vy) = input_to_virtual((cur_x, cur_y), self.device_model);
-                            info!("Idle watcher: stroke ended near ({:.1}, {:.1}), resetting idle timer", vx, vy);
+                            info!(
+                                "Idle watcher: {} stroke ended near ({:.1}, {:.1}), resetting idle timer",
+                                if rubber_active { "eraser" } else { "pen" },
+                                vx,
+                                vy
+                            );
                         }
                     }
                 }
