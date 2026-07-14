@@ -271,11 +271,17 @@ impl Touch {
     }
 
     pub async fn tap_middle_bottom(&mut self) -> Result<()> {
-        self.touch_start((384, 1023)).await?; // middle bottom
+        self.tap_for_cursor((384, 1023)).await // middle bottom
+    }
+
+    /// Tap an arbitrary point to position the text-insertion cursor used by
+    /// the keyboard's progress dots (and, before that, `draw_text`). Unlike
+    /// `tap_middle_bottom`, this lets the caller place the cursor near the
+    /// current question rather than always at a fixed screen location.
+    pub async fn tap_for_cursor(&mut self, xy: (i32, i32)) -> Result<()> {
+        self.touch_start(xy).await?;
         sleep(Duration::from_millis(100)).await;
         self.touch_stop().await?;
-        // sleep(Duration::from_millis(10));
-        // sleep(Duration::from_millis(100));
         Ok(())
     }
 

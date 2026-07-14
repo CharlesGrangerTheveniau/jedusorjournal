@@ -147,7 +147,7 @@ mod tests {
 
 use anyhow::Result;
 use evdev::{Device, EventStream, EventType as EvdevEventType};
-use log::info;
+use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -230,6 +230,31 @@ impl TripleTapWatcher {
         }
     }
 
+    /// Re-open the pen input device from scratch and replace `event_stream`.
+    /// Called right after a drawing pass finishes: the diary's own bursts of
+    /// simulated pen events flow through this same fd, and on real hardware
+    /// the async event stream has been observed to go completely silent
+    /// afterward (no more events ever delivered, even for genuine new
+    /// writing) — most likely a lost epoll/mio readiness notification after
+    /// that burst. Discarding the old fd and opening a fresh one clears
+    /// whatever stuck state caused it, at negligible cost since this only
+    /// runs once per answer.
+    fn reopen_stream(&mut self) {
+        let pen_input_device = match self.device_model {
+            DeviceModel::RemarkablePaperPro => "/dev/input/event2",
+            _ => "/dev/input/event1",
+        };
+        match Device::open(pen_input_device).and_then(|d| d.into_event_stream()) {
+            Ok(stream) => {
+                info!("Gesture watcher: reopened pen input stream after drawing finished");
+                self.event_stream = Some(stream);
+            }
+            Err(e) => {
+                warn!("Gesture watcher: failed to reopen pen input stream: {}", e);
+            }
+        }
+    }
+
     /// Wait until three consecutive, pairwise-adjacent, quick taps are
     /// drawn on the pen digitizer (like "…"), returning the centroid of
     /// the three in virtual screen coordinates. Any non-tap stroke (normal
@@ -239,7 +264,7 @@ impl TripleTapWatcher {
     /// discarding it entirely, so "tap, [pause], tap, tap" still fires if
     /// the last two are close enough.
     pub async fn wait_for_triple_tap(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
-        let Some(stream) = &mut self.event_stream else {
+        if self.event_stream.is_none() {
             // No-gesture mode: block until cancelled, like Touch's no-stream path.
             loop {
                 if cancellation.should_cancel_main() {
@@ -247,7 +272,7 @@ impl TripleTapWatcher {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-        };
+        }
 
         let mut points: Vec<(f32, f32)> = Vec::new();
         let mut cur_x = 0.0f32;
@@ -255,15 +280,43 @@ impl TripleTapWatcher {
         let mut stroke_start: Option<Instant> = None;
         // Taps confirmed so far in the current chain (0, 1, or 2 entries).
         let mut chain: Vec<((f32, f32), Instant)> = Vec::new();
+        // Tracks the drawing_in_progress flag's last-seen value so the Tick
+        // branch below can detect the falling edge (drawing just finished)
+        // even if no further pen events ever arrive to wake the event branch.
+        let mut was_drawing = false;
+
+        enum Woke {
+            Event(std::io::Result<evdev::InputEvent>),
+            Tick,
+        }
 
         loop {
-            let event = tokio::select! {
-                _ = async {
-                    while !cancellation.should_cancel_main() {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let woke = {
+                let stream = self.event_stream.as_mut().expect("checked event_stream.is_none() above");
+                tokio::select! {
+                    _ = async {
+                        while !cancellation.should_cancel_main() {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } => return Err(anyhow::anyhow!("Gesture waiting cancelled")),
+                    ev = stream.next_event() => Woke::Event(ev),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => Woke::Tick,
+                }
+            };
+
+            let event = match woke {
+                Woke::Tick => {
+                    let now_drawing = self.drawing_in_progress.load(Ordering::Relaxed);
+                    if was_drawing && !now_drawing {
+                        self.reopen_stream();
+                        points.clear();
+                        stroke_start = None;
+                        chain.clear();
                     }
-                } => return Err(anyhow::anyhow!("Gesture waiting cancelled")),
-                ev = stream.next_event() => ev?,
+                    was_drawing = now_drawing;
+                    continue;
+                }
+                Woke::Event(ev) => ev?,
             };
 
             if self.drawing_in_progress.load(Ordering::Relaxed) {
@@ -275,8 +328,10 @@ impl TripleTapWatcher {
                 points.clear();
                 stroke_start = None;
                 chain.clear();
+                was_drawing = true;
                 continue;
             }
+            was_drawing = false;
 
             match (event.event_type(), event.code(), event.value()) {
                 (EvdevEventType::KEY, BTN_TOUCH, 1) => {

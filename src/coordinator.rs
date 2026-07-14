@@ -326,6 +326,7 @@ pub async fn processing_task(
     engine: Arc<TokioMutex<Box<dyn LLMEngine>>>,
     progress_tx: watch::Sender<ProgressState>,
     cancellation: Arc<GhostwriterCancellation>,
+    gesture_anchor: GestureAnchor,
 ) -> Result<()> {
     info!("Processing task: starting");
 
@@ -359,7 +360,11 @@ pub async fn processing_task(
         return Ok(());
     }
 
-    // Tap middle bottom to position cursor for text input (before showing "Thinking").
+    // Position the cursor for text input (before showing "Thinking"). If we
+    // have a gesture anchor (the triple-tap trigger's location), tap there so
+    // the progress dots appear right next to the current question instead of
+    // always at a fixed screen location — otherwise (corner-tap trigger, no
+    // anchor) fall back to the old fixed middle-bottom position.
     // Use a fresh Touch instance rather than the shared `touch` RwLock: when the
     // trigger came from the gesture watcher (not a corner tap), trigger_task is
     // still holding that lock indefinitely inside wait_for_trigger, waiting for
@@ -368,8 +373,14 @@ pub async fn processing_task(
     // already uses for exactly this reason.
     if !config.is_test_mode() {
         let trigger_corner = TriggerCorner::from_string(&config.trigger_corner).unwrap_or(TriggerCorner::UpperRight);
-        if let Err(e) = Touch::new(config.no_draw, trigger_corner).tap_middle_bottom().await {
-            info!("Failed to tap middle bottom: {}", e);
+        let mut touch = Touch::new(config.no_draw, trigger_corner);
+        let anchor = *gesture_anchor.lock().await;
+        let cursor_result = match anchor {
+            Some((ax, ay)) => touch.tap_for_cursor((ax as i32, ay as i32)).await,
+            None => touch.tap_middle_bottom().await,
+        };
+        if let Err(e) = cursor_result {
+            info!("Failed to position cursor for progress dots: {}", e);
         }
     }
 
