@@ -403,6 +403,7 @@ async fn run_ghostwriter_loop(
 
     // Get initial config
     let config = shared_config.read().await.clone();
+    info!("Using model: {}", config.model);
 
     // Create coordinator channels
     let channels = CoordinatorChannels::new();
