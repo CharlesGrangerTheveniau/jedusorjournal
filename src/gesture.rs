@@ -97,9 +97,22 @@ impl IdleWatcher {
             _ => "/dev/input/event1",
         };
         let event_stream = if no_gesture {
+            info!("Idle watcher: disabled (no-gesture/no-draw mode)");
             None
         } else {
-            Device::open(pen_input_device).ok().and_then(|d| d.into_event_stream().ok())
+            // Log both outcomes explicitly: a silent None here means the idle
+            // trigger never fires for the whole process lifetime, which
+            // otherwise looks identical to "user simply hasn't written yet".
+            match Device::open(pen_input_device).and_then(|d| d.into_event_stream()) {
+                Ok(stream) => {
+                    info!("Idle watcher: armed on {} ({}ms idle delay)", pen_input_device, config.idle_delay_ms);
+                    Some(stream)
+                }
+                Err(e) => {
+                    warn!("Idle watcher: FAILED to open {} — idle trigger will never fire: {}", pen_input_device, e);
+                    None
+                }
+            }
         };
         Self {
             event_stream,

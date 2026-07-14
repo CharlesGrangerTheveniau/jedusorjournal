@@ -11,7 +11,7 @@
       },
       "text": {
         "type": "string",
-        "description": "The text to write in cursive. Write in the same language as the question (French or English). Keep it concise — a sentence or two."
+        "description": "The text to write in cursive, answering the newest question on the page. Write in the same language as the question (French or English). One to four sentences — long enough to genuinely answer the question, not just acknowledge it."
       },
       "x": {
         "type": "integer",

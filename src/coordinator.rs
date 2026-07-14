@@ -441,6 +441,19 @@ pub async fn processing_task(
         prompt.push_str(&seg_desc);
     }
 
+    // Tell the model where the user's newest writing ends. Without this, on
+    // a page holding several already-answered questions, the model has to
+    // guess which question is the new one — observed on device: a follow-up
+    // was answered with a re-answer of the first question. The anchor comes
+    // from real pen events (where the last stroke ended), so it's ground
+    // truth the vision pass can't misread.
+    if let Some((ax, ay)) = *gesture_anchor.lock().await {
+        prompt.push_str(&format!(
+            "\n\nHint: the user's newest writing ends near pixel (x={:.0}, y={:.0}). The question to answer is the one ending there; everything above it that already has a cursive answer is history.",
+            ax, ay
+        ));
+    }
+
     // Prepare engine
     let mut engine_guard = engine.lock().await;
     engine_guard.clear_content();
