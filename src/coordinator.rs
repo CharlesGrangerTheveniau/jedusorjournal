@@ -20,14 +20,14 @@ use crate::touch::{Touch, TriggerCorner};
 pub enum TriggerEvent {
     /// User touched the trigger corner
     UserTouch,
-    /// User drew the triple-tap gesture; carries the anchor point (virtual
-    /// px) to place the answer below.
-    TripleTapGesture { anchor_x: f32, anchor_y: f32 },
+    /// The pen went idle after new writing; carries the last pen position
+    /// (virtual px) to place the answer below.
+    IdleTrigger { anchor_x: f32, anchor_y: f32 },
     /// Trigger via web API (for testing/simulation)
     WebTrigger,
 }
 
-/// Last gesture anchor point (virtual px), consumed by the write_cursive
+/// Last idle-trigger anchor point (virtual px), consumed by the write_cursive
 /// tool callback to place the answer. `None` after a corner-tap trigger —
 /// the tool falls back to a fixed position in that case.
 pub type GestureAnchor = Arc<TokioMutex<Option<(f32, f32)>>>;
@@ -173,21 +173,21 @@ pub async fn trigger_task(
     Ok(())
 }
 
-/// Task that waits for the triple-tap gesture and notifies the
-/// coordinator, running alongside `trigger_task`'s corner-tap watcher.
+/// Task that waits for the pen to go idle after new writing and notifies
+/// the coordinator, running alongside `trigger_task`'s corner-tap watcher.
 pub async fn gesture_trigger_task(
-    mut watcher: crate::gesture::TripleTapWatcher,
+    mut watcher: crate::gesture::IdleWatcher,
     trigger_tx: mpsc::Sender<TriggerEvent>,
     cancellation: Arc<GhostwriterCancellation>,
     gesture_anchor: GestureAnchor,
 ) -> Result<()> {
     info!("Gesture trigger task starting");
     loop {
-        match watcher.wait_for_triple_tap(&cancellation).await {
+        match watcher.wait_for_idle_trigger(&cancellation).await {
             Ok((anchor_x, anchor_y)) => {
-                info!("Gesture trigger task: triple-tap detected at ({}, {})", anchor_x, anchor_y);
+                info!("Gesture trigger task: idle trigger fired at ({}, {})", anchor_x, anchor_y);
                 *gesture_anchor.lock().await = Some((anchor_x, anchor_y));
-                if trigger_tx.send(TriggerEvent::TripleTapGesture { anchor_x, anchor_y }).await.is_err() {
+                if trigger_tx.send(TriggerEvent::IdleTrigger { anchor_x, anchor_y }).await.is_err() {
                     info!("Trigger receiver dropped, exiting gesture trigger task");
                     break;
                 }
@@ -197,7 +197,7 @@ pub async fn gesture_trigger_task(
                     info!("Gesture trigger task: cancelled (likely config change)");
                     return Ok(());
                 }
-                info!("Gesture trigger task: error waiting for triple-tap: {}", e);
+                info!("Gesture trigger task: error waiting for idle trigger: {}", e);
                 return Err(e);
             }
         }

@@ -146,27 +146,16 @@ pub struct Args {
     #[arg(long, default_value = "220")]
     cursive_word_gap_ms: u64,
 
-    /// Maximum duration (ms) for a single tap of the trigger double-tap
-    #[arg(long, default_value = "400")]
-    gesture_max_tap_duration_ms: u64,
+    /// How long the pen must be continuously inactive (ms) after new writing
+    /// before the diary auto-triggers and answers
+    #[arg(long, default_value = "3500")]
+    idle_trigger_delay_ms: u64,
 
-    /// Maximum bounding-box size (virtual px) for a single tap of the trigger double-tap
-    #[arg(long, default_value = "12.0")]
-    gesture_max_tap_bbox_px: f32,
-
-    /// Maximum gap (ms) between the two taps of the trigger double-tap
-    #[arg(long, default_value = "1200")]
-    gesture_max_pair_gap_ms: u64,
-
-    /// Maximum distance (virtual px) between the two taps of the trigger double-tap
-    #[arg(long, default_value = "20.0")]
-    gesture_max_pair_distance_px: f32,
-
-    /// Disable the double-tap gesture trigger (corner tap still works)
+    /// Disable the idle auto-trigger (corner tap still works)
     #[arg(long)]
     no_gesture: bool,
 
-    /// Log per-stroke geometry (turn angle, bbox, duration) for calibrating gesture thresholds
+    /// Log per-stroke pen activity for calibrating the idle trigger delay
     #[arg(long)]
     log_gestures: bool,
 
@@ -489,15 +478,12 @@ async fn run_ghostwriter_loop(
         let cancellation = Arc::clone(&cancellation);
         let gesture_anchor = Arc::clone(&gesture_anchor);
         let drawing_in_progress = Arc::clone(&drawing_in_progress);
-        let triple_tap_config = ghostwriter::gesture::TripleTapConfig {
-            max_tap_duration_ms: config.gesture_max_tap_duration_ms,
-            max_tap_bbox_px: config.gesture_max_tap_bbox_px,
-            max_pair_gap_ms: config.gesture_max_pair_gap_ms,
-            max_pair_distance_px: config.gesture_max_pair_distance_px,
+        let idle_trigger_config = ghostwriter::gesture::IdleTriggerConfig {
+            idle_delay_ms: config.idle_trigger_delay_ms,
         };
-        let watcher = ghostwriter::gesture::TripleTapWatcher::new(
+        let watcher = ghostwriter::gesture::IdleWatcher::new(
             config.no_gesture || config.no_draw,
-            triple_tap_config,
+            idle_trigger_config,
             config.log_gestures,
             drawing_in_progress,
         );

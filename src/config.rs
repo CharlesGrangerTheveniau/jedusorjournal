@@ -36,10 +36,7 @@ pub struct Config {
     pub diary_notebook: Option<String>,
     pub cursive_x_height_px: f32,
     pub cursive_word_gap_ms: u64,
-    pub gesture_max_tap_duration_ms: u64,
-    pub gesture_max_tap_bbox_px: f32,
-    pub gesture_max_pair_gap_ms: u64,
-    pub gesture_max_pair_distance_px: f32,
+    pub idle_trigger_delay_ms: u64,
     pub no_gesture: bool,
     pub log_gestures: bool,
     // Simulation/test mode options
@@ -80,10 +77,7 @@ impl Default for Config {
             diary_notebook: None,
             cursive_x_height_px: 14.0,
             cursive_word_gap_ms: 220,
-            gesture_max_tap_duration_ms: 400,
-            gesture_max_tap_bbox_px: 12.0,
-            gesture_max_pair_gap_ms: 1200,
-            gesture_max_pair_distance_px: 20.0,
+            idle_trigger_delay_ms: 3500,
             no_gesture: false,
             log_gestures: false,
             // Simulation/test mode defaults

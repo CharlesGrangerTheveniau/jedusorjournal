@@ -1,156 +1,24 @@
-//! Triple-tap gesture detection: the user ends a question with three quick,
-//! adjacent taps of the pen (like an ellipsis: "…"), which triggers the
-//! diary to answer.
+//! Idle-based auto-trigger: once the user stops writing anywhere on the
+//! page for `idle_delay_ms` of continuous pen inactivity, the diary
+//! automatically takes a screenshot and answers — no tap or gesture
+//! required at all.
 //!
-//! Originally a double-tap (two taps), but real on-device testing showed
-//! that two small, quick, closely-spaced taps are geometrically
-//! indistinguishable from incidental marks in normal handwriting — French
-//! accent marks in particular are exactly this shape, and one accidentally
-//! paired with a nearby dot fired the trigger mid-sentence, sending an
-//! incomplete question to the LLM. Three consecutive taps all pairwise
-//! close in time and space is a much rarer accidental coincidence while
-//! remaining a fast, deliberate gesture to perform on purpose.
-
-#[derive(Debug, Clone, Copy)]
-pub struct TripleTapConfig {
-    pub max_tap_duration_ms: u64,
-    pub max_tap_bbox_px: f32,
-    pub max_pair_gap_ms: u64,
-    pub max_pair_distance_px: f32,
-}
-
-impl Default for TripleTapConfig {
-    fn default() -> Self {
-        Self {
-            max_tap_duration_ms: 400,
-            max_tap_bbox_px: 12.0,
-            max_pair_gap_ms: 1200,
-            max_pair_distance_px: 20.0,
-        }
-    }
-}
-
-/// Detect whether a completed pen stroke (points in virtual screen space)
-/// is a "tap": a small, quick, nearly-stationary mark like a period —
-/// clearly smaller and faster than any letter (verified on real device
-/// data: even the smallest tested letters were 20px+ and 300ms+).
-pub fn is_tap(points: &[(f32, f32)], duration_ms: u64, config: &TripleTapConfig) -> bool {
-    if points.is_empty() {
-        return false;
-    }
-    if duration_ms > config.max_tap_duration_ms {
-        return false;
-    }
-    let (min_x, min_y, max_x, max_y) = bounding_box(points);
-    let max_dim = (max_x - min_x).max(max_y - min_y);
-    max_dim <= config.max_tap_bbox_px
-}
-
-/// Detect whether two taps (each already confirmed via `is_tap`) are close
-/// enough in time and space to be consecutive members of the same
-/// deliberate tap sequence.
-pub fn is_tap_pair(first_center: (f32, f32), second_center: (f32, f32), gap_ms: u64, config: &TripleTapConfig) -> bool {
-    if gap_ms > config.max_pair_gap_ms {
-        return false;
-    }
-    let dx = second_center.0 - first_center.0;
-    let dy = second_center.1 - first_center.1;
-    let dist = (dx * dx + dy * dy).sqrt();
-    dist <= config.max_pair_distance_px
-}
-
-fn bounding_box(points: &[(f32, f32)]) -> (f32, f32, f32, f32) {
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for &(x, y) in points {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-    (min_x, min_y, max_x, max_y)
-}
-
-fn bbox_center(points: &[(f32, f32)]) -> (f32, f32) {
-    let (min_x, min_y, max_x, max_y) = bounding_box(points);
-    ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A small cluster of points confined to a tiny area, simulating a
-    /// quick pen tap (period-sized mark).
-    fn synthetic_tap(cx: f32, cy: f32, radius: f32, n: usize) -> Vec<(f32, f32)> {
-        (0..n)
-            .map(|i| {
-                let t = i as f32 / (n - 1).max(1) as f32;
-                let angle = t * 2.0 * std::f32::consts::PI;
-                (cx + radius * angle.cos(), cy + radius * angle.sin())
-            })
-            .collect()
-    }
-
-    #[test]
-    fn detects_a_quick_small_tap() {
-        let points = synthetic_tap(100.0, 100.0, 3.0, 6);
-        assert!(is_tap(&points, 150, &TripleTapConfig::default()));
-    }
-
-    #[test]
-    fn rejects_a_tap_that_is_too_big() {
-        // Bigger than any letter observed in real calibration data (20px+).
-        let points = synthetic_tap(100.0, 100.0, 15.0, 6);
-        assert!(!is_tap(&points, 150, &TripleTapConfig::default()));
-    }
-
-    #[test]
-    fn rejects_a_tap_drawn_too_slowly() {
-        let points = synthetic_tap(100.0, 100.0, 3.0, 6);
-        assert!(!is_tap(&points, 600, &TripleTapConfig::default()));
-    }
-
-    #[test]
-    fn rejects_an_empty_stroke() {
-        assert!(!is_tap(&[], 100, &TripleTapConfig::default()));
-    }
-
-    #[test]
-    fn accepts_two_adjacent_taps_close_in_time() {
-        let config = TripleTapConfig::default();
-        assert!(is_tap_pair((100.0, 100.0), (110.0, 102.0), 500, &config));
-    }
-
-    #[test]
-    fn rejects_two_taps_too_far_apart_in_time() {
-        let config = TripleTapConfig::default();
-        assert!(!is_tap_pair((100.0, 100.0), (110.0, 102.0), 2000, &config));
-    }
-
-    #[test]
-    fn rejects_two_taps_too_far_apart_in_space() {
-        let config = TripleTapConfig::default();
-        assert!(!is_tap_pair((100.0, 100.0), (300.0, 100.0), 500, &config));
-    }
-
-    #[test]
-    fn bbox_center_of_a_single_point_is_itself() {
-        let points = vec![(50.0, 60.0)];
-        assert_eq!(bbox_center(&points), (50.0, 60.0));
-    }
-}
-
-// --- Stateful watcher that reads the real pen input device ---
+//! This replaces an earlier tap-based gesture design (double-tap, then
+//! triple-tap) that proved unreliable on real hardware: small quick taps
+//! are geometrically similar to incidental marks in normal handwriting
+//! (French accents in particular), causing false triggers on incomplete
+//! questions. Watching for plain inactivity sidesteps that whole class of
+//! problem — any real stroke, tap-shaped or not, just resets the timer, and
+//! only genuine silence ever fires it. It also needs far less state: no
+//! per-stroke shape classification, no multi-tap chaining, just "when did
+//! the last stroke end".
 
 use anyhow::Result;
 use evdev::{Device, EventStream, EventType as EvdevEventType};
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cancellation::GhostwriterCancellation;
 use crate::device::DeviceModel;
@@ -190,27 +58,38 @@ fn input_to_virtual((x, y): (f32, f32), device_model: DeviceModel) -> (f32, f32)
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IdleTriggerConfig {
+    /// How long the pen must be continuously inactive (no stroke anywhere on
+    /// the page) before the diary auto-triggers.
+    pub idle_delay_ms: u64,
+}
+
+impl Default for IdleTriggerConfig {
+    fn default() -> Self {
+        Self { idle_delay_ms: 3500 }
+    }
+}
+
 /// Shared flag the drawing code sets to `true` for the duration of a
-/// write_cursive drawing pass, so the gesture watcher can ignore its own
-/// simulated pen events instead of risking a false trigger. Confirmed on
-/// real hardware: the diary's own simulated strokes appear on the same
+/// write_cursive drawing pass, so the watcher can ignore its own simulated
+/// pen events instead of treating them as user activity (which would keep
+/// resetting the idle timer forever) or risking a false trigger. Confirmed
+/// on real hardware: the diary's own simulated strokes appear on the same
 /// pen input device the watcher reads, indistinguishable from real user
-/// input by the watcher alone — during one drawing pass, a burst of
-/// self-generated strokes accidentally paired into a spurious trigger
-/// (caught harmlessly by the existing "ignore triggers received during
-/// processing" drain, but a real gap worth closing here directly).
+/// input by the watcher alone.
 pub type DrawingInProgress = Arc<AtomicBool>;
 
-pub struct TripleTapWatcher {
+pub struct IdleWatcher {
     event_stream: Option<EventStream>,
     device_model: DeviceModel,
-    config: TripleTapConfig,
+    config: IdleTriggerConfig,
     log_gestures: bool,
     drawing_in_progress: DrawingInProgress,
 }
 
-impl TripleTapWatcher {
-    pub fn new(no_gesture: bool, config: TripleTapConfig, log_gestures: bool, drawing_in_progress: DrawingInProgress) -> Self {
+impl IdleWatcher {
+    pub fn new(no_gesture: bool, config: IdleTriggerConfig, log_gestures: bool, drawing_in_progress: DrawingInProgress) -> Self {
         let device_model = DeviceModel::detect();
         let pen_input_device = match device_model {
             DeviceModel::RemarkablePaperPro => "/dev/input/event2",
@@ -246,43 +125,38 @@ impl TripleTapWatcher {
         };
         match Device::open(pen_input_device).and_then(|d| d.into_event_stream()) {
             Ok(stream) => {
-                info!("Gesture watcher: reopened pen input stream after drawing finished");
+                info!("Idle watcher: reopened pen input stream after drawing finished");
                 self.event_stream = Some(stream);
             }
             Err(e) => {
-                warn!("Gesture watcher: failed to reopen pen input stream: {}", e);
+                warn!("Idle watcher: failed to reopen pen input stream: {}", e);
             }
         }
     }
 
-    /// Wait until three consecutive, pairwise-adjacent, quick taps are
-    /// drawn on the pen digitizer (like "…"), returning the centroid of
-    /// the three in virtual screen coordinates. Any non-tap stroke (normal
-    /// writing) clears the whole in-progress chain, so only a genuinely
-    /// uninterrupted run of three taps counts — a tap that doesn't pair
-    /// with the previous one restarts the chain from itself rather than
-    /// discarding it entirely, so "tap, [pause], tap, tap" still fires if
-    /// the last two are close enough.
-    pub async fn wait_for_triple_tap(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
+    /// Wait until the pen has been inactive for `config.idle_delay_ms` after
+    /// at least one genuine stroke, returning the last observed pen position
+    /// (virtual screen coordinates) as the placement anchor. Any real stroke
+    /// resets the idle clock, so the trigger only fires once the user has
+    /// actually stopped writing — no explicit gesture needed.
+    pub async fn wait_for_idle_trigger(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
         if self.event_stream.is_none() {
             // No-gesture mode: block until cancelled, like Touch's no-stream path.
             loop {
                 if cancellation.should_cancel_main() {
                     return Err(anyhow::anyhow!("Gesture waiting cancelled"));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
 
-        let mut points: Vec<(f32, f32)> = Vec::new();
         let mut cur_x = 0.0f32;
         let mut cur_y = 0.0f32;
-        let mut stroke_start: Option<Instant> = None;
-        // Taps confirmed so far in the current chain (0, 1, or 2 entries).
-        let mut chain: Vec<((f32, f32), Instant)> = Vec::new();
-        // Tracks the drawing_in_progress flag's last-seen value so the Tick
-        // branch below can detect the falling edge (drawing just finished)
-        // even if no further pen events ever arrive to wake the event branch.
+        let mut in_stroke = false;
+        // Set on every genuine stroke-end; cleared once we've fired (or once
+        // a drawing pass finishes, so the diary's own strokes never count).
+        let mut last_activity: Option<Instant> = None;
+        let mut has_new_content = false;
         let mut was_drawing = false;
 
         enum Woke {
@@ -296,11 +170,11 @@ impl TripleTapWatcher {
                 tokio::select! {
                     _ = async {
                         while !cancellation.should_cancel_main() {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                     } => return Err(anyhow::anyhow!("Gesture waiting cancelled")),
                     ev = stream.next_event() => Woke::Event(ev),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => Woke::Tick,
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => Woke::Tick,
                 }
             };
 
@@ -309,11 +183,23 @@ impl TripleTapWatcher {
                     let now_drawing = self.drawing_in_progress.load(Ordering::Relaxed);
                     if was_drawing && !now_drawing {
                         self.reopen_stream();
-                        points.clear();
-                        stroke_start = None;
-                        chain.clear();
+                        // The diary just finished drawing its own answer —
+                        // don't let that count as "new content" to answer again.
+                        has_new_content = false;
+                        last_activity = None;
+                        in_stroke = false;
                     }
                     was_drawing = now_drawing;
+
+                    if !now_drawing && has_new_content {
+                        if let Some(t) = last_activity {
+                            if t.elapsed() >= Duration::from_millis(self.config.idle_delay_ms) {
+                                let anchor = input_to_virtual((cur_x, cur_y), self.device_model);
+                                info!("Idle trigger fired at ({:.1}, {:.1}) after {}ms of inactivity", anchor.0, anchor.1, self.config.idle_delay_ms);
+                                return Ok(anchor);
+                            }
+                        }
+                    }
                     continue;
                 }
                 Woke::Event(ev) => ev?,
@@ -321,13 +207,9 @@ impl TripleTapWatcher {
 
             if self.drawing_in_progress.load(Ordering::Relaxed) {
                 // The diary is currently drawing its own answer, which
-                // generates real pen events on this same device. Ignore
-                // everything until drawing finishes, and drop any
-                // in-progress stroke/chain state so we don't misinterpret
-                // the tail of a self-generated stroke once we resume.
-                points.clear();
-                stroke_start = None;
-                chain.clear();
+                // generates real pen events on this same device. Ignore it
+                // entirely rather than treating it as user activity.
+                in_stroke = false;
                 was_drawing = true;
                 continue;
             }
@@ -335,80 +217,19 @@ impl TripleTapWatcher {
 
             match (event.event_type(), event.code(), event.value()) {
                 (EvdevEventType::KEY, BTN_TOUCH, 1) => {
-                    points.clear();
-                    stroke_start = Some(Instant::now());
+                    in_stroke = true;
                 }
                 (EvdevEventType::ABSOLUTE, ABS_X, v) => cur_x = v as f32,
                 (EvdevEventType::ABSOLUTE, ABS_Y, v) => cur_y = v as f32,
                 (EvdevEventType::KEY, BTN_TOUCH, 0) => {
-                    let Some(start) = stroke_start.take() else { continue };
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let virtual_points: Vec<(f32, f32)> =
-                        points.iter().map(|&p| input_to_virtual(p, self.device_model)).collect();
-                    let tap = is_tap(&virtual_points, duration_ms, &self.config);
-
-                    if self.log_gestures {
-                        let (bx0, by0, bx1, by1) = bounding_box(&virtual_points);
-                        let bbox_dim = (bx1 - bx0).max(by1 - by0);
-                        info!(
-                            "gesture stroke: {} points, duration={}ms, bbox_max_dim={:.1}px => {}",
-                            virtual_points.len(),
-                            duration_ms,
-                            bbox_dim,
-                            if tap { "TAP" } else { "not a tap (normal writing)" }
-                        );
-                    }
-
-                    if !tap {
-                        // Anything that isn't a tap clears the whole chain — a
-                        // triple-tap trigger requires three uninterrupted taps,
-                        // with nothing else drawn in between.
-                        chain.clear();
-                        continue;
-                    }
-
-                    let this_center = bbox_center(&virtual_points);
-                    let this_time = Instant::now();
-
-                    let pairs_with_last = chain
-                        .last()
-                        .map(|&(prev_center, prev_time)| {
-                            let gap_ms = prev_time.elapsed().as_millis() as u64;
-                            let dx = this_center.0 - prev_center.0;
-                            let dy = this_center.1 - prev_center.1;
-                            let dist = (dx * dx + dy * dy).sqrt();
-                            let paired = is_tap_pair(prev_center, this_center, gap_ms, &self.config);
-                            if self.log_gestures {
-                                info!(
-                                    "tap pair check: chain_len={}, gap={}ms, dist={:.1}px => {}",
-                                    chain.len(),
-                                    gap_ms,
-                                    dist,
-                                    if paired { "PAIRED" } else { "not paired" }
-                                );
-                            }
-                            paired
-                        })
-                        .unwrap_or(false);
-
-                    if pairs_with_last {
-                        chain.push((this_center, this_time));
-                        if chain.len() == 3 {
-                            let (sum_x, sum_y) = chain.iter().fold((0.0, 0.0), |(sx, sy), &((x, y), _)| (sx + x, sy + y));
-                            let anchor = (sum_x / 3.0, sum_y / 3.0);
-                            info!("Triple-tap detected at ({:.1}, {:.1})", anchor.0, anchor.1);
-                            return Ok(anchor);
+                    if in_stroke {
+                        in_stroke = false;
+                        has_new_content = true;
+                        last_activity = Some(Instant::now());
+                        if self.log_gestures {
+                            let (vx, vy) = input_to_virtual((cur_x, cur_y), self.device_model);
+                            info!("Idle watcher: stroke ended near ({:.1}, {:.1}), resetting idle timer", vx, vy);
                         }
-                    } else {
-                        // Didn't pair with the chain's last tap (or chain was
-                        // empty) — start a fresh chain from this tap.
-                        chain.clear();
-                        chain.push((this_center, this_time));
-                    }
-                }
-                (EvdevEventType::SYNCHRONIZATION, _, _) => {
-                    if stroke_start.is_some() {
-                        points.push((cur_x, cur_y));
                     }
                 }
                 _ => {}
