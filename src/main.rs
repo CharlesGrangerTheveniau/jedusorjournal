@@ -54,7 +54,7 @@ pub struct Args {
     engine_api_key: Option<String>,
 
     /// Sets the model to use
-    #[arg(long, short, default_value = "claude-sonnet-4-6")]
+    #[arg(long, short, default_value = "claude-haiku-4-5-20251001")]
     model: String,
 
     /// Sets the prompt to use
