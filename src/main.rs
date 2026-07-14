@@ -773,11 +773,19 @@ fn register_tools(
                 // above their own question, and each new answer landed above the
                 // previous one instead of below it. The anchor sits on the same
                 // line as the end of the question (the taps are drawn right after
-                // it), so offset one line down to start the answer on a fresh line
-                // rather than overlapping the question's own line.
+                // it), so drop below it before starting the answer.
+                //
+                // This clearance is a fixed screen-space margin, deliberately NOT
+                // derived from the answer's own (small, 14px) cursive x-height: an
+                // earlier version used `x_height_px * line_spacing_mult` (~31px)
+                // and the answer still overlapped the question, because that's far
+                // smaller than a typical line of the user's own (much larger)
+                // handwriting — confirmed on a device screenshot where the offset
+                // wasn't enough to clear the question's own descenders.
+                const ANCHOR_CLEARANCE_PX: f32 = 70.0;
                 let anchor = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { *gesture_anchor.lock().await }));
                 let y = match anchor {
-                    Some((_, anchor_y)) => anchor_y + cursive_config.layout.x_height_px * cursive_config.layout.line_spacing_mult,
+                    Some((_, anchor_y)) => anchor_y + ANCHOR_CLEARANCE_PX,
                     None => arguments["y"].as_i64().map(|v| v as f32).unwrap_or(400.0),
                 };
                 info!(
