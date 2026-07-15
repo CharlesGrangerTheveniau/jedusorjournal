@@ -778,7 +778,7 @@ fn register_tools(
                 // handwriting — confirmed on a device screenshot where the offset
                 // wasn't enough to clear the question's own descenders.
                 const ANCHOR_CLEARANCE_PX: f32 = 70.0;
-                let anchor = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { *gesture_anchor.lock().await }));
+                let anchor = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { gesture_anchor.lock().await.map(|t| t.anchor) }));
                 let y = match anchor {
                     Some((_, anchor_y)) => anchor_y + ANCHOR_CLEARANCE_PX,
                     None => arguments["y"].as_i64().map(|v| v as f32).unwrap_or(400.0),

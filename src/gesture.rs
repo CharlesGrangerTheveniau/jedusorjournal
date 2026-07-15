@@ -81,6 +81,26 @@ impl Default for IdleTriggerConfig {
 /// input by the watcher alone.
 pub type DrawingInProgress = Arc<AtomicBool>;
 
+/// What the idle trigger observed, in virtual screen coordinates: where the
+/// newest writing ended (used to place the answer below it) and the bounding
+/// box of every pen stroke seen since the watcher was (re)armed — i.e. the
+/// region containing the newest question. The bbox is ground truth from real
+/// pen events, letting downstream code crop the question out of the
+/// screenshot instead of asking a vision model to find it spatially.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleTrigger {
+    pub anchor: (f32, f32),
+    /// (min_x, min_y, max_x, max_y)
+    pub bbox: (f32, f32, f32, f32),
+}
+
+fn expand_bbox(bbox: &mut Option<(f32, f32, f32, f32)>, (x, y): (f32, f32)) {
+    *bbox = Some(match *bbox {
+        None => (x, y, x, y),
+        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+    });
+}
+
 pub struct IdleWatcher {
     event_stream: Option<EventStream>,
     device_model: DeviceModel,
@@ -149,11 +169,11 @@ impl IdleWatcher {
     }
 
     /// Wait until the pen has been inactive for `config.idle_delay_ms` after
-    /// at least one genuine stroke, returning the last observed pen position
-    /// (virtual screen coordinates) as the placement anchor. Any real stroke
-    /// resets the idle clock, so the trigger only fires once the user has
-    /// actually stopped writing — no explicit gesture needed.
-    pub async fn wait_for_idle_trigger(&mut self, cancellation: &GhostwriterCancellation) -> Result<(f32, f32)> {
+    /// at least one genuine stroke, returning where the writing ended and the
+    /// bounding box of all of it (virtual screen coordinates). Any real
+    /// stroke resets the idle clock, so the trigger only fires once the user
+    /// has actually stopped writing — no explicit gesture needed.
+    pub async fn wait_for_idle_trigger(&mut self, cancellation: &GhostwriterCancellation) -> Result<IdleTrigger> {
         if self.event_stream.is_none() {
             // No-gesture mode: block until cancelled, like Touch's no-stream path.
             loop {
@@ -182,6 +202,10 @@ impl IdleWatcher {
         // the time the idle timer fires the live position may have drifted
         // to wherever the user is hovering, not where they stopped writing.
         let mut last_stroke_end: Option<(f32, f32)> = None;
+        // Bounding box of every pen-stroke point seen this call — i.e. of
+        // the newest question, since each call spans exactly the writing
+        // between two triggers.
+        let mut content_bbox: Option<(f32, f32, f32, f32)> = None;
         let mut was_drawing = false;
 
         enum Woke {
@@ -213,6 +237,7 @@ impl IdleWatcher {
                         has_new_content = false;
                         last_activity = None;
                         last_stroke_end = None;
+                        content_bbox = None;
                         in_stroke = false;
                     }
                     was_drawing = now_drawing;
@@ -221,8 +246,15 @@ impl IdleWatcher {
                         if let Some(t) = last_activity {
                             if t.elapsed() >= Duration::from_millis(self.config.idle_delay_ms) {
                                 let anchor = last_stroke_end.unwrap_or_else(|| input_to_virtual((cur_x, cur_y), self.device_model));
-                                info!("Idle trigger fired at ({:.1}, {:.1}) after {}ms of inactivity", anchor.0, anchor.1, self.config.idle_delay_ms);
-                                return Ok(anchor);
+                                // Degenerate fallback (shouldn't happen: any pen
+                                // stroke expands the bbox): a small box around
+                                // the anchor.
+                                let bbox = content_bbox.unwrap_or((anchor.0 - 50.0, anchor.1 - 30.0, anchor.0 + 50.0, anchor.1 + 10.0));
+                                info!(
+                                    "Idle trigger fired at ({:.1}, {:.1}), content bbox ({:.0}, {:.0})-({:.0}, {:.0}), after {}ms of inactivity",
+                                    anchor.0, anchor.1, bbox.0, bbox.1, bbox.2, bbox.3, self.config.idle_delay_ms
+                                );
+                                return Ok(IdleTrigger { anchor, bbox });
                             }
                         }
                     }
@@ -260,8 +292,18 @@ impl IdleWatcher {
                 (EvdevEventType::KEY, BTN_TOUCH, 1) => {
                     in_stroke = true;
                 }
-                (EvdevEventType::ABSOLUTE, ABS_X, v) => cur_x = v as f32,
-                (EvdevEventType::ABSOLUTE, ABS_Y, v) => cur_y = v as f32,
+                (EvdevEventType::ABSOLUTE, ABS_X, v) => {
+                    cur_x = v as f32;
+                    if in_stroke && !rubber_active {
+                        expand_bbox(&mut content_bbox, input_to_virtual((cur_x, cur_y), self.device_model));
+                    }
+                }
+                (EvdevEventType::ABSOLUTE, ABS_Y, v) => {
+                    cur_y = v as f32;
+                    if in_stroke && !rubber_active {
+                        expand_bbox(&mut content_bbox, input_to_virtual((cur_x, cur_y), self.device_model));
+                    }
+                }
                 (EvdevEventType::KEY, BTN_TOUCH, 0) => {
                     if in_stroke {
                         in_stroke = false;

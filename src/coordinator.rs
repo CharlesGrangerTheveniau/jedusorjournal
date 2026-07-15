@@ -27,10 +27,11 @@ pub enum TriggerEvent {
     WebTrigger,
 }
 
-/// Last idle-trigger anchor point (virtual px), consumed by the write_cursive
-/// tool callback to place the answer. `None` after a corner-tap trigger —
-/// the tool falls back to a fixed position in that case.
-pub type GestureAnchor = Arc<TokioMutex<Option<(f32, f32)>>>;
+/// Last idle-trigger observation (anchor + newest-writing bbox, virtual px),
+/// consumed by processing_task (question-region crop, prompt hint, cursor
+/// placement) and the write_cursive tool callback (answer placement). `None`
+/// after a corner-tap trigger — everything falls back to fixed positions.
+pub type GestureAnchor = Arc<TokioMutex<Option<crate::gesture::IdleTrigger>>>;
 
 /// Progress states during AI processing
 /// Uses ModelExecutionStatus for LLM operations, plus additional states for the full workflow
@@ -184,9 +185,10 @@ pub async fn gesture_trigger_task(
     info!("Gesture trigger task starting");
     loop {
         match watcher.wait_for_idle_trigger(&cancellation).await {
-            Ok((anchor_x, anchor_y)) => {
+            Ok(trigger) => {
+                let (anchor_x, anchor_y) = trigger.anchor;
                 info!("Gesture trigger task: idle trigger fired at ({}, {})", anchor_x, anchor_y);
-                *gesture_anchor.lock().await = Some((anchor_x, anchor_y));
+                *gesture_anchor.lock().await = Some(trigger);
                 if trigger_tx.send(TriggerEvent::IdleTrigger { anchor_x, anchor_y }).await.is_err() {
                     info!("Trigger receiver dropped, exiting gesture trigger task");
                     break;
@@ -374,7 +376,7 @@ pub async fn processing_task(
     if !config.is_test_mode() {
         let trigger_corner = TriggerCorner::from_string(&config.trigger_corner).unwrap_or(TriggerCorner::UpperRight);
         let mut touch = Touch::new(config.no_draw, trigger_corner);
-        let anchor = *gesture_anchor.lock().await;
+        let anchor = gesture_anchor.lock().await.map(|t| t.anchor);
         let cursor_result = match anchor {
             Some((ax, ay)) => touch.tap_for_cursor((ax as i32, ay as i32)).await,
             None => touch.tap_middle_bottom().await,
@@ -447,17 +449,40 @@ pub async fn processing_task(
     // was answered with a re-answer of the first question. The anchor comes
     // from real pen events (where the last stroke ended), so it's ground
     // truth the vision pass can't misread.
-    if let Some((ax, ay)) = *gesture_anchor.lock().await {
+    let idle_trigger = *gesture_anchor.lock().await;
+    if let Some(trig) = idle_trigger {
+        let (ax, ay) = trig.anchor;
         prompt.push_str(&format!(
             "\n\nHint: the user's newest writing ends near pixel (x={:.0}, y={:.0}). The question to answer is the one ending there; everything above it that already has a cursive answer is history.",
             ax, ay
         ));
     }
 
+    // Crop the newest-question band out of the screenshot and send it as a
+    // second image. The pixel hint above still requires the model to map a
+    // coordinate onto its visual reading of a full page of handwriting —
+    // spatial grounding that small vision models do badly (observed on
+    // device: a follow-up got a re-answer of the first question even with
+    // the hint). The stroke bbox comes from real pen events, so this crop
+    // isolates exactly the newest question with no vision-side guessing.
+    let question_crop = idle_trigger.and_then(|trig| match crop_question_band(&base64_image, trig.bbox) {
+        Ok(crop) => Some(crop),
+        Err(e) => {
+            info!("Failed to crop newest-question region, sending full page only: {}", e);
+            None
+        }
+    });
+
     // Prepare engine
     let mut engine_guard = engine.lock().await;
     engine_guard.clear_content();
     engine_guard.add_image_content(&base64_image);
+    if let Some(crop) = &question_crop {
+        engine_guard.add_text_content(
+            "The image above is the full page (context and conversation history). The next image is a crop of the same page containing ONLY the newest question — this is the question you must answer.",
+        );
+        engine_guard.add_image_content(crop);
+    }
     engine_guard.add_text_content(&prompt);
 
     // Create status callback that wraps model execution status in LlmState
@@ -500,4 +525,29 @@ pub async fn processing_task(
             Err(e)
         }
     }
+}
+
+/// Crop a full-width horizontal band around the newest question's stroke
+/// bbox out of the (already virtual-space, 768x1024) screenshot PNG, and
+/// return it re-encoded as base64 PNG. Full width rather than the tight
+/// bbox: a question is a line (or a few) of writing, and keeping the whole
+/// band preserves any part of the line the bbox undershot, at no cost to
+/// the isolation that makes the crop useful.
+fn crop_question_band(base64_png: &str, bbox: (f32, f32, f32, f32)) -> Result<String> {
+    const MARGIN_PX: f32 = 40.0;
+
+    let bytes = BASE64_STANDARD.decode(base64_png)?;
+    let img = image::load_from_memory(&bytes)?;
+    let height = img.height() as f32;
+
+    let y0 = (bbox.1 - MARGIN_PX).max(0.0);
+    let y1 = (bbox.3 + MARGIN_PX).min(height);
+    if y1 - y0 < 1.0 {
+        return Err(anyhow::anyhow!("Degenerate question bbox: y range {}..{}", y0, y1));
+    }
+
+    let cropped = img.crop_imm(0, y0 as u32, img.width(), (y1 - y0) as u32);
+    let mut out = Vec::new();
+    cropped.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(BASE64_STANDARD.encode(&out))
 }
