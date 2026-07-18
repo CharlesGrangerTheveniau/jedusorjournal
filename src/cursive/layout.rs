@@ -27,7 +27,14 @@ impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
             x_height_px: 28.0,
-            line_spacing_mult: 2.2,
+            // Line height as a multiple of x-height. EMS Allure's ascenders
+            // and descenders each extend well beyond the x-height band
+            // (ascenders to ~2x, descenders to ~-1x in font units), so at
+            // 2.2 consecutive lines visibly collided — confirmed on a device
+            // screenshot at x_height_px=14, where every multi-line answer's
+            // descenders crashed into the next line's ascenders. 3.2 gives
+            // each line clear air while staying compact.
+            line_spacing_mult: 3.2,
             word_spacing_mult: 1.2,
         }
     }

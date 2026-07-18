@@ -8,10 +8,12 @@
 //! are geometrically similar to incidental marks in normal handwriting
 //! (French accents in particular), causing false triggers on incomplete
 //! questions. Watching for plain inactivity sidesteps that whole class of
-//! problem — any real stroke, tap-shaped or not, just resets the timer, and
-//! only genuine silence ever fires it. It also needs far less state: no
-//! per-stroke shape classification, no multi-tap chaining, just "when did
-//! the last stroke end".
+//! problem — any real stroke just resets the timer, and only genuine
+//! silence ever fires it. One piece of per-stroke classification survives
+//! from the tap era, inverted: tap-shaped strokes (toolbar interactions
+//! done with the pen, stray punctuation) DELAY the trigger but never ARM
+//! it — see `TAP_MAX_DURATION_MS` below for the on-device incident that
+//! made this necessary.
 
 use anyhow::Result;
 use evdev::{Device, EventStream, EventType as EvdevEventType};
@@ -27,6 +29,21 @@ const ABS_X: u16 = 0;
 const ABS_Y: u16 = 1;
 const BTN_TOOL_RUBBER: u16 = 321;
 const BTN_TOUCH: u16 = 330;
+
+/// A "tap": a short, tiny stroke. On this device that's either a toolbar/
+/// palette interaction done with the pen (the sidebar UI responds to pen
+/// taps, which land on this same digitizer as writing) or stray punctuation
+/// (periods, i-dots). Neither is a question: taps must never ARM the idle
+/// trigger, only delay it. Confirmed on device: switching pen type via the
+/// toolbar produced a chain of taps in the sidebar column, which armed the
+/// trigger and fired mid-question with a bogus toolbar-strip content bbox
+/// of (0,109)-(115,392). Real writing always contains non-tap strokes, so
+/// dots and accents still get answered as part of their question.
+/// Thresholds from the earlier triple-tap-era calibration on real strokes:
+/// the smallest genuine letters measured 20px+ and 300ms+, while taps sat
+/// well under both limits.
+const TAP_MAX_DURATION_MS: u64 = 400;
+const TAP_MAX_BBOX_PX: f32 = 12.0;
 
 // Duplicated from pen.rs / touch.rs by existing project convention (each
 // device-facing module keeps its own copy of these small constants rather
@@ -187,6 +204,10 @@ impl IdleWatcher {
         let mut cur_x = 0.0f32;
         let mut cur_y = 0.0f32;
         let mut in_stroke = false;
+        // Per-stroke measurements for the tap classifier: when the current
+        // stroke started, and the bbox of just this stroke.
+        let mut stroke_start: Option<Instant> = None;
+        let mut stroke_bbox: Option<(f32, f32, f32, f32)> = None;
         // Whether the pen's eraser end is currently the active tool. Eraser
         // strokes still reset the idle clock (don't fire mid-erase) but do
         // NOT count as new content — erasing after an answer shouldn't
@@ -280,6 +301,8 @@ impl IdleWatcher {
                 // generates real pen events on this same device. Ignore it
                 // entirely rather than treating it as user activity.
                 in_stroke = false;
+                stroke_start = None;
+                stroke_bbox = None;
                 was_drawing = true;
                 continue;
             }
@@ -291,37 +314,56 @@ impl IdleWatcher {
                 }
                 (EvdevEventType::KEY, BTN_TOUCH, 1) => {
                     in_stroke = true;
+                    stroke_start = Some(Instant::now());
+                    stroke_bbox = None;
                 }
                 (EvdevEventType::ABSOLUTE, ABS_X, v) => {
                     cur_x = v as f32;
-                    if in_stroke && !rubber_active {
-                        expand_bbox(&mut content_bbox, input_to_virtual((cur_x, cur_y), self.device_model));
+                    if in_stroke {
+                        expand_bbox(&mut stroke_bbox, input_to_virtual((cur_x, cur_y), self.device_model));
                     }
                 }
                 (EvdevEventType::ABSOLUTE, ABS_Y, v) => {
                     cur_y = v as f32;
-                    if in_stroke && !rubber_active {
-                        expand_bbox(&mut content_bbox, input_to_virtual((cur_x, cur_y), self.device_model));
+                    if in_stroke {
+                        expand_bbox(&mut stroke_bbox, input_to_virtual((cur_x, cur_y), self.device_model));
                     }
                 }
                 (EvdevEventType::KEY, BTN_TOUCH, 0) => {
                     if in_stroke {
                         in_stroke = false;
-                        // Any stroke (pen or eraser) resets the idle clock so
-                        // we never fire mid-activity, but only pen strokes
-                        // count as content worth answering.
+                        // Any stroke (pen, eraser, or tap) resets the idle
+                        // clock so we never fire mid-activity — but only
+                        // non-tap pen strokes ARM the trigger and extend the
+                        // question bbox. Excluding taps from the bbox also
+                        // keeps toolbar taps from stretching the crop to the
+                        // sidebar; genuine punctuation sits inside the line's
+                        // bbox anyway (the crop adds margin).
                         last_activity = Some(Instant::now());
-                        if !rubber_active {
+                        let duration_ms = stroke_start.take().map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                        let this_bbox = stroke_bbox.take();
+                        let max_dim = this_bbox.map(|(x0, y0, x1, y1)| (x1 - x0).max(y1 - y0)).unwrap_or(0.0);
+                        let tap_like = duration_ms <= TAP_MAX_DURATION_MS && max_dim <= TAP_MAX_BBOX_PX;
+                        if !rubber_active && !tap_like {
                             has_new_content = true;
                             last_stroke_end = Some(input_to_virtual((cur_x, cur_y), self.device_model));
+                            if let Some((x0, y0, x1, y1)) = this_bbox {
+                                expand_bbox(&mut content_bbox, (x0, y0));
+                                expand_bbox(&mut content_bbox, (x1, y1));
+                            }
                         }
                         if self.log_gestures {
                             let (vx, vy) = input_to_virtual((cur_x, cur_y), self.device_model);
+                            let kind = if rubber_active {
+                                "eraser"
+                            } else if tap_like {
+                                "tap (UI/punctuation, not arming)"
+                            } else {
+                                "pen"
+                            };
                             info!(
-                                "Idle watcher: {} stroke ended near ({:.1}, {:.1}), resetting idle timer",
-                                if rubber_active { "eraser" } else { "pen" },
-                                vx,
-                                vy
+                                "Idle watcher: {} stroke ended near ({:.1}, {:.1}) ({}ms, {:.1}px), resetting idle timer",
+                                kind, vx, vy, duration_ms, max_dim
                             );
                         }
                     }
