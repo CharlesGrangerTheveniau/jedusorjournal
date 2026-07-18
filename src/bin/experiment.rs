@@ -100,6 +100,26 @@ enum Commands {
     DrawSvgScale3x { svg_string: String },
     /// Render an SVG string with configurable threshold + bidirectional scan
     DrawSvgThresholdBidi { svg_string: String, threshold: u8 },
+    /// Print the top and bottom rows containing ink (dark pixels), scanning
+    /// the page area only (x >= 80, skipping the toolbar column). Used to
+    /// measure how far a swipe scrolled the canvas.
+    InkBounds,
+    /// Measure the vertical scroll shift between two screenshots by
+    /// cross-correlating their per-row ink-count profiles (page area only,
+    /// x >= 80). Prints the shift in px (positive = content moved UP).
+    ShiftBetween { png_a: String, png_b: String },
+    /// Slow swipe ending with a stationary hold before lifting, so the
+    /// release velocity is zero and no momentum/fling scroll kicks in.
+    SwipeHold { x1: i32, y1: i32, x2: i32, y2: i32, steps: u32, step_ms: u64, hold_ms: u64 },
+}
+
+/// Per-row count of dark pixels in the page area (x >= 80, toolbar excluded).
+fn row_ink_profile(path: &str) -> Result<Vec<u32>> {
+    let img = image::open(path)?.to_luma8();
+    let (w, h) = (img.width().min(768), img.height().min(1024));
+    Ok((0..h)
+        .map(|y| (80..w).step_by(2).filter(|&x| img.get_pixel(x, y).0[0] < 80).count() as u32)
+        .collect())
 }
 
 #[tokio::main]
@@ -394,6 +414,78 @@ async fn main() -> Result<()> {
             })
             .await?;
             println!("Drew SVG threshold-bidi threshold={} ({} chars)", threshold, svg_string.len());
+        }
+
+        Commands::InkBounds => {
+            let mut screenshot = Screenshot::new()?;
+            screenshot.take_screenshot()?;
+            // Decode ONCE via a temp PNG: Screenshot::get_pixel re-decodes
+            // the stored PNG on every call, which at ~350k sampled pixels
+            // spins the CPU for minutes on-device.
+            let tmp = "/tmp/inkbounds.png";
+            screenshot.save_image(tmp)?;
+            let img = image::open(tmp)?.to_luma8();
+            let (w, h) = (img.width().min(768), img.height().min(1024));
+            let mut top: Option<u32> = None;
+            let mut bottom: Option<u32> = None;
+            for y in 0..h {
+                // Skip the toolbar column (x < 80); sample every 2px.
+                let has_ink = (80..w).step_by(2).any(|x| img.get_pixel(x, y).0[0] < 80);
+                if has_ink {
+                    if top.is_none() {
+                        top = Some(y);
+                    }
+                    bottom = Some(y);
+                }
+            }
+            match (top, bottom) {
+                (Some(t), Some(b)) => println!("ink top={} bottom={}", t, b),
+                _ => println!("no ink found"),
+            }
+        }
+
+        Commands::ShiftBetween { png_a, png_b } => {
+            let a = row_ink_profile(&png_a)?;
+            let b = row_ink_profile(&png_b)?;
+            let n = a.len().min(b.len());
+            // For each candidate shift s (content moved UP by s px between A
+            // and B), compare A's row y+s against B's row y over the overlap
+            // and score by sum of absolute differences (lower = better).
+            let mut best = (0i32, u64::MAX);
+            for s in -950i32..=950 {
+                let mut cost: u64 = 0;
+                let mut count = 0u32;
+                for y in 0..n as i32 {
+                    let ya = y + s;
+                    if ya < 0 || ya >= n as i32 {
+                        continue;
+                    }
+                    cost += (a[ya as usize] as i64 - b[y as usize] as i64).unsigned_abs();
+                    count += 1;
+                }
+                if count > 60 {
+                    let normalized = cost * 1024 / count as u64;
+                    if normalized < best.1 {
+                        best = (s, normalized);
+                    }
+                }
+            }
+            println!("shift={} (cost={})", best.0, best.1);
+        }
+
+        Commands::SwipeHold { x1, y1, x2, y2, steps, step_ms, hold_ms } => {
+            let mut touch = Touch::new(false, TriggerCorner::UpperRight);
+            touch.touch_start((x1, y1)).await?;
+            for i in 0..=steps {
+                let t = i as f32 / steps.max(1) as f32;
+                let x = (x1 as f32 + (x2 - x1) as f32 * t) as i32;
+                let y = (y1 as f32 + (y2 - y1) as f32 * t) as i32;
+                touch.goto_xy((x, y)).await?;
+                sleep(Duration::from_millis(step_ms)).await;
+            }
+            sleep(Duration::from_millis(hold_ms)).await;
+            touch.touch_stop().await?;
+            println!("Swipe-hold from ({}, {}) to ({}, {}), {} steps x {}ms, hold {}ms", x1, y1, x2, y2, steps, step_ms, hold_ms);
         }
     }
 

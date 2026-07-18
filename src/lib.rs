@@ -11,6 +11,7 @@ pub mod llm_engine;
 pub mod notebook;
 pub mod pen;
 pub mod screenshot;
+pub mod scroll;
 pub mod segmenter;
 pub mod simulation;
 pub mod status;

@@ -169,18 +169,18 @@ impl IdleWatcher {
     /// that burst. Discarding the old fd and opening a fresh one clears
     /// whatever stuck state caused it, at negligible cost since this only
     /// runs once per answer.
-    fn reopen_stream(&mut self) {
+    fn reopen_stream(&mut self, reason: &str) {
         let pen_input_device = match self.device_model {
             DeviceModel::RemarkablePaperPro => "/dev/input/event2",
             _ => "/dev/input/event1",
         };
         match Device::open(pen_input_device).and_then(|d| d.into_event_stream()) {
             Ok(stream) => {
-                info!("Idle watcher: reopened pen input stream after drawing finished");
+                info!("Idle watcher: reopened pen input stream ({})", reason);
                 self.event_stream = Some(stream);
             }
             Err(e) => {
-                warn!("Idle watcher: failed to reopen pen input stream: {}", e);
+                warn!("Idle watcher: failed to reopen pen input stream ({}): {}", reason, e);
             }
         }
     }
@@ -228,6 +228,16 @@ impl IdleWatcher {
         // between two triggers.
         let mut content_bbox: Option<(f32, f32, f32, f32)> = None;
         let mut was_drawing = false;
+        // When the fd last delivered ANY event. The pen stream has been seen
+        // to go silent for good on this hardware (a page switch preceded one
+        // occurrence; lost epoll readiness suspected) — with no event ever
+        // arriving, only a timer can notice. Since genuine idleness and a
+        // dead fd look identical from here, proactively reopen after a long
+        // silence: harmless when truly idle (mere fd churn between strokes),
+        // and it caps any silent death at PROACTIVE_REOPEN_SILENCE of missed
+        // input. Guarded on !in_stroke so a slow writer is never interrupted.
+        const PROACTIVE_REOPEN_SILENCE: Duration = Duration::from_secs(30);
+        let mut last_event_seen = Instant::now();
 
         enum Woke {
             Event(std::io::Result<evdev::InputEvent>),
@@ -252,7 +262,7 @@ impl IdleWatcher {
                 Woke::Tick => {
                     let now_drawing = self.drawing_in_progress.load(Ordering::Relaxed);
                     if was_drawing && !now_drawing {
-                        self.reopen_stream();
+                        self.reopen_stream("drawing finished");
                         // The diary just finished drawing its own answer —
                         // don't let that count as "new content" to answer again.
                         has_new_content = false;
@@ -260,6 +270,10 @@ impl IdleWatcher {
                         last_stroke_end = None;
                         content_bbox = None;
                         in_stroke = false;
+                        last_event_seen = Instant::now();
+                    } else if !now_drawing && !in_stroke && last_event_seen.elapsed() >= PROACTIVE_REOPEN_SILENCE {
+                        self.reopen_stream("proactive: no events for 30s");
+                        last_event_seen = Instant::now();
                     }
                     was_drawing = now_drawing;
 
@@ -281,7 +295,10 @@ impl IdleWatcher {
                     }
                     continue;
                 }
-                Woke::Event(Ok(ev)) => ev,
+                Woke::Event(Ok(ev)) => {
+                    last_event_seen = Instant::now();
+                    ev
+                }
                 Woke::Event(Err(e)) => {
                     // Don't let a transient read error kill the trigger task
                     // for the rest of the process lifetime — the pen fd has
@@ -289,8 +306,9 @@ impl IdleWatcher {
                     // `reopen_stream`), so treat errors the same way: drop
                     // the fd, reopen, carry on.
                     warn!("Idle watcher: pen input stream error: {} — reopening stream", e);
-                    self.reopen_stream();
+                    self.reopen_stream("read error");
                     in_stroke = false;
+                    last_event_seen = Instant::now();
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }

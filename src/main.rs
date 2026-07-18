@@ -759,8 +759,11 @@ fn register_tools(
                         return;
                     }
                 };
-                let x = arguments["x"].as_i64().unwrap_or(60) as f32;
-                let width = arguments["width"].as_i64().unwrap_or(650) as f32;
+                // Clamp the left edge clear of the toolbar column: the model
+                // once chose x=50 and the answer's first letters sat hidden
+                // under the sidebar overlay (seen on a device screenshot).
+                let x = (arguments["x"].as_i64().unwrap_or(60) as f32).max(90.0);
+                let width = (arguments["width"].as_i64().unwrap_or(650) as f32).min(768.0 - 20.0 - x);
                 // Ignore the model's own y guess whenever we have a gesture anchor:
                 // it's measured directly from the real triple-tap position (ground
                 // truth), while the model's pixel-level guess from the screenshot
@@ -794,6 +797,47 @@ fn register_tools(
                 );
 
                 if !no_draw {
+                    // Estimate the answer's ink bottom by dry-running the layout,
+                    // and if it would clip past the viewport bottom (ink beyond
+                    // y=1024 is silently lost — confirmed on device by a long
+                    // answer whose tail never appeared), scroll the canvas up
+                    // first. Scrolling is closed-loop (fling + measure, see
+                    // src/scroll.rs) because reMarkable flings have momentum;
+                    // the drawing y is then adjusted by the MEASURED shift.
+                    const BOTTOM_MARGIN: f32 = 24.0;
+                    let mut y_draw = y;
+                    {
+                        let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
+                        let words = ghostwriter::cursive::layout::layout(&font, text, &placement, &cursive_config.layout);
+                        let ink_bottom = words
+                            .iter()
+                            .flat_map(|w| w.strokes.iter())
+                            .flat_map(|s| s.iter())
+                            .map(|p| p.1)
+                            .fold(0.0f32, f32::max);
+                        if ink_bottom > 1024.0 - BOTTOM_MARGIN {
+                            let needed = ink_bottom - (1024.0 - BOTTOM_MARGIN);
+                            info!("write_cursive: answer would clip (ink bottom {:.0}px), scrolling for {:.0}px of room", ink_bottom, needed);
+                            let shift = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(ghostwriter::scroll::scroll_up_to_make_room(needed))
+                            })
+                            .unwrap_or_else(|e| {
+                                log::error!("write_cursive: scroll failed: {}", e);
+                                0.0
+                            });
+                            if shift > 0.0 {
+                                // The question (and everything else) moved up by
+                                // `shift`; follow it. If the question scrolled
+                                // clear off the top, everything below the top
+                                // margin is blank space beneath it on the canvas.
+                                y_draw = (y - shift).max(60.0);
+                                info!("write_cursive: scrolled {:.0}px, drawing at adjusted y={:.1}", shift, y_draw);
+                            } else {
+                                info!("write_cursive: page did not scroll (fixed page or at limit), drawing as placed");
+                            }
+                        }
+                    }
+
                     // Deliberately does NOT switch pen tool before drawing — draws
                     // with whatever tool the user currently has selected. An earlier
                     // version called select_calligraphy_pen() here, but that left the
@@ -802,7 +846,7 @@ fn register_tools(
                     // comment), which surprised the user's own subsequent writing.
                     // Trading pen-style consistency for not touching the user's tool
                     // state at all.
-                    let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
+                    let placement = ghostwriter::cursive::Placement { x, y: y_draw, max_width: width };
                     let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
                     // Suspend the gesture watcher while drawing: our own simulated
                     // pen strokes loop back onto the same input device it reads
