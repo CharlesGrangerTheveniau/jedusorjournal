@@ -13,16 +13,25 @@ use crate::llm_engine::{LLMEngine, ModelExecutionStatus};
 use crate::screenshot::Screenshot;
 use crate::segmenter::ImageAnalyzer;
 use crate::simulation::SimulationConfig;
-use crate::touch::Touch;
+use crate::touch::{Touch, TriggerCorner};
 
 /// Events that can trigger AI processing
 #[derive(Debug, Clone)]
 pub enum TriggerEvent {
     /// User touched the trigger corner
     UserTouch,
+    /// The pen went idle after new writing; carries the last pen position
+    /// (virtual px) to place the answer below.
+    IdleTrigger { anchor_x: f32, anchor_y: f32 },
     /// Trigger via web API (for testing/simulation)
     WebTrigger,
 }
+
+/// Last idle-trigger observation (anchor + newest-writing bbox, virtual px),
+/// consumed by processing_task (question-region crop, prompt hint, cursor
+/// placement) and the write_cursive tool callback (answer placement). `None`
+/// after a corner-tap trigger — everything falls back to fixed positions.
+pub type GestureAnchor = Arc<TokioMutex<Option<crate::gesture::IdleTrigger>>>;
 
 /// Progress states during AI processing
 /// Uses ModelExecutionStatus for LLM operations, plus additional states for the full workflow
@@ -86,6 +95,7 @@ pub async fn trigger_task(
     trigger_tx: mpsc::Sender<TriggerEvent>,
     cancellation: Arc<GhostwriterCancellation>,
     no_trigger: bool,
+    gesture_anchor: GestureAnchor,
 ) -> Result<()> {
     info!("Trigger task starting");
 
@@ -133,6 +143,10 @@ pub async fn trigger_task(
                 drop(touch_guard);
                 debug!("Trigger task: dropped touch write lock");
 
+                // Clear any stale gesture anchor so a corner tap after a
+                // stale spiral doesn't reuse an old anchor position.
+                *gesture_anchor.lock().await = None;
+
                 if trigger_tx.send(TriggerEvent::UserTouch).await.is_err() {
                     info!("Trigger receiver dropped, exiting trigger task");
                     break;
@@ -157,6 +171,39 @@ pub async fn trigger_task(
 
     debug!("Escaped from trigger task loop");
 
+    Ok(())
+}
+
+/// Task that waits for the pen to go idle after new writing and notifies
+/// the coordinator, running alongside `trigger_task`'s corner-tap watcher.
+pub async fn gesture_trigger_task(
+    mut watcher: crate::gesture::IdleWatcher,
+    trigger_tx: mpsc::Sender<TriggerEvent>,
+    cancellation: Arc<GhostwriterCancellation>,
+    gesture_anchor: GestureAnchor,
+) -> Result<()> {
+    info!("Gesture trigger task starting");
+    loop {
+        match watcher.wait_for_idle_trigger(&cancellation).await {
+            Ok(trigger) => {
+                let (anchor_x, anchor_y) = trigger.anchor;
+                info!("Gesture trigger task: idle trigger fired at ({}, {})", anchor_x, anchor_y);
+                *gesture_anchor.lock().await = Some(trigger);
+                if trigger_tx.send(TriggerEvent::IdleTrigger { anchor_x, anchor_y }).await.is_err() {
+                    info!("Trigger receiver dropped, exiting gesture trigger task");
+                    break;
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("cancelled") {
+                    info!("Gesture trigger task: cancelled (likely config change)");
+                    return Ok(());
+                }
+                info!("Gesture trigger task: error waiting for idle trigger: {}", e);
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -232,9 +279,9 @@ pub async fn progress_task(
                         }
                         ProgressState::LlmState(ModelExecutionStatus::BuildingContext) => {
                             info!("Progress: Building context...");
-                            if let Ok(mut kb) = keyboard.lock() {
-                                let _ = kb.progress("Thinking");
-                            }
+                            // No label — just the dots (added below, ticking every
+                            // 500ms during LlmProcessing). A visible "Thinking" word
+                            // breaks the diary's fiction more than a bare "..." does.
                         }
                         ProgressState::LlmState(ModelExecutionStatus::LlmProcessing) => {
                             info!("Progress: Thinking...");
@@ -281,7 +328,7 @@ pub async fn processing_task(
     engine: Arc<TokioMutex<Box<dyn LLMEngine>>>,
     progress_tx: watch::Sender<ProgressState>,
     cancellation: Arc<GhostwriterCancellation>,
-    touch: Arc<tokio::sync::RwLock<Touch>>,
+    gesture_anchor: GestureAnchor,
 ) -> Result<()> {
     info!("Processing task: starting");
 
@@ -315,9 +362,28 @@ pub async fn processing_task(
         return Ok(());
     }
 
-    // Tap middle bottom to position cursor for text input (before showing "Thinking")
-    if let Err(e) = touch.write().await.tap_middle_bottom().await {
-        info!("Failed to tap middle bottom: {}", e);
+    // Position the cursor for text input (before showing "Thinking"). If we
+    // have a gesture anchor (the triple-tap trigger's location), tap there so
+    // the progress dots appear right next to the current question instead of
+    // always at a fixed screen location — otherwise (corner-tap trigger, no
+    // anchor) fall back to the old fixed middle-bottom position.
+    // Use a fresh Touch instance rather than the shared `touch` RwLock: when the
+    // trigger came from the gesture watcher (not a corner tap), trigger_task is
+    // still holding that lock indefinitely inside wait_for_trigger, waiting for
+    // a corner tap that may never come — acquiring the shared lock here would
+    // deadlock. This mirrors the same pattern draw_svg's tool registration
+    // already uses for exactly this reason.
+    if !config.is_test_mode() {
+        let trigger_corner = TriggerCorner::from_string(&config.trigger_corner).unwrap_or(TriggerCorner::UpperRight);
+        let mut touch = Touch::new(config.no_draw, trigger_corner);
+        let anchor = gesture_anchor.lock().await.map(|t| t.anchor);
+        let cursor_result = match anchor {
+            Some((ax, ay)) => touch.tap_for_cursor((ax as i32, ay as i32)).await,
+            None => touch.tap_middle_bottom().await,
+        };
+        if let Err(e) = cursor_result {
+            info!("Failed to position cursor for progress dots: {}", e);
+        }
     }
 
     // Update progress: building context
@@ -349,12 +415,26 @@ pub async fn processing_task(
         None
     };
 
-    // Load prompt
-    let prompt_general_raw = load_config(&config.prompt);
+    // Select prompt: diary persona if the currently open document matches
+    // the configured diary notebook, otherwise the neutral cursive prompt
+    // (or the user's explicit --prompt override, for the legacy draw_text/
+    // draw_svg experience).
+    let prompt_file = if let Some(explicit) = &config.prompt {
+        explicit.clone()
+    } else {
+        match (&config.diary_notebook, crate::notebook::detect_open_document()) {
+            (Some(diary_uuid), Some(open_uuid)) if diary_uuid == &open_uuid => {
+                info!("processing_task: diary notebook open, using diary persona");
+                "diary.json".to_string()
+            }
+            _ => "neutral_cursive.json".to_string(),
+        }
+    };
+    let prompt_general_raw = load_config(&prompt_file);
     let prompt_general_json = serde_json::from_str::<serde_json::Value>(prompt_general_raw.as_str())?;
     let mut prompt = prompt_general_json["prompt"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Prompt file '{}' missing required 'prompt' field", config.prompt))?
+        .ok_or_else(|| anyhow::anyhow!("Prompt file '{}' missing required 'prompt' field", prompt_file))?
         .to_string();
 
     // Add segmentation to prompt if available
@@ -363,10 +443,46 @@ pub async fn processing_task(
         prompt.push_str(&seg_desc);
     }
 
+    // Tell the model where the user's newest writing ends. Without this, on
+    // a page holding several already-answered questions, the model has to
+    // guess which question is the new one — observed on device: a follow-up
+    // was answered with a re-answer of the first question. The anchor comes
+    // from real pen events (where the last stroke ended), so it's ground
+    // truth the vision pass can't misread.
+    let idle_trigger = *gesture_anchor.lock().await;
+    if let Some(trig) = idle_trigger {
+        let (ax, ay) = trig.anchor;
+        prompt.push_str(&format!(
+            "\n\nHint: the user's newest writing ends near pixel (x={:.0}, y={:.0}). The question to answer is the one ending there; everything above it that already has a cursive answer is history.",
+            ax, ay
+        ));
+    }
+
+    // Crop the newest-question band out of the screenshot and send it as a
+    // second image. The pixel hint above still requires the model to map a
+    // coordinate onto its visual reading of a full page of handwriting —
+    // spatial grounding that small vision models do badly (observed on
+    // device: a follow-up got a re-answer of the first question even with
+    // the hint). The stroke bbox comes from real pen events, so this crop
+    // isolates exactly the newest question with no vision-side guessing.
+    let question_crop = idle_trigger.and_then(|trig| match crop_question_band(&base64_image, trig.bbox) {
+        Ok(crop) => Some(crop),
+        Err(e) => {
+            info!("Failed to crop newest-question region, sending full page only: {}", e);
+            None
+        }
+    });
+
     // Prepare engine
     let mut engine_guard = engine.lock().await;
     engine_guard.clear_content();
     engine_guard.add_image_content(&base64_image);
+    if let Some(crop) = &question_crop {
+        engine_guard.add_text_content(
+            "The image above is the full page (context and conversation history). The next image is a crop of the same page containing ONLY the newest question — this is the question you must answer.",
+        );
+        engine_guard.add_image_content(crop);
+    }
     engine_guard.add_text_content(&prompt);
 
     // Create status callback that wraps model execution status in LlmState
@@ -409,4 +525,29 @@ pub async fn processing_task(
             Err(e)
         }
     }
+}
+
+/// Crop a full-width horizontal band around the newest question's stroke
+/// bbox out of the (already virtual-space, 768x1024) screenshot PNG, and
+/// return it re-encoded as base64 PNG. Full width rather than the tight
+/// bbox: a question is a line (or a few) of writing, and keeping the whole
+/// band preserves any part of the line the bbox undershot, at no cost to
+/// the isolation that makes the crop useful.
+fn crop_question_band(base64_png: &str, bbox: (f32, f32, f32, f32)) -> Result<String> {
+    const MARGIN_PX: f32 = 40.0;
+
+    let bytes = BASE64_STANDARD.decode(base64_png)?;
+    let img = image::load_from_memory(&bytes)?;
+    let height = img.height() as f32;
+
+    let y0 = (bbox.1 - MARGIN_PX).max(0.0);
+    let y1 = (bbox.3 + MARGIN_PX).min(height);
+    if y1 - y0 < 1.0 {
+        return Err(anyhow::anyhow!("Degenerate question bbox: y range {}..{}", y0, y1));
+    }
+
+    let cropped = img.crop_imm(0, y0 as u32, img.width(), (y1 - y0) as u32);
+    let mut out = Vec::new();
+    cropped.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(BASE64_STANDARD.encode(&out))
 }

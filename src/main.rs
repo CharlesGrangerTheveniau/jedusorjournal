@@ -3,6 +3,7 @@ use clap::Parser;
 use dotenv::dotenv;
 use log::info;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
@@ -20,7 +21,7 @@ use ghostwriter::{
     pen::Pen,
     simulation::SimulationConfig,
     status::GhostwriterStatus,
-    touch::{PenTool, Touch, TriggerCorner},
+    touch::{Touch, TriggerCorner},
     util::{setup_uinput, svg_to_alpha_bitmap, svg_to_bitmap, write_bitmap_to_file, OptionMap},
     web_server::start_web_server,
 };
@@ -53,12 +54,12 @@ pub struct Args {
     engine_api_key: Option<String>,
 
     /// Sets the model to use
-    #[arg(long, short, default_value = "claude-sonnet-4-6")]
+    #[arg(long, short, default_value = "claude-haiku-4-5-20251001")]
     model: String,
 
     /// Sets the prompt to use
-    #[arg(long, default_value = "general.json")]
-    prompt: String,
+    #[arg(long)]
+    prompt: Option<String>,
 
     /// Do not actually submit to the model, for testing
     #[arg(short, long)]
@@ -131,6 +132,32 @@ pub struct Args {
     /// Sets which corner the touch trigger listens to (UR, UL, LR, LL, upper-right, upper-left, lower-right, lower-left)
     #[arg(long, default_value = "UR")]
     trigger_corner: String,
+
+    /// UUID of the designated diary notebook (gets the Tom Jedusor persona prompt).
+    /// Any other document still gets a cursive answer via the neutral prompt.
+    #[arg(long)]
+    diary_notebook: Option<String>,
+
+    /// Cursive x-height in virtual pixels (glyph size)
+    #[arg(long, default_value = "14.0")]
+    cursive_x_height_px: f32,
+
+    /// Pause between words while writing cursive, in milliseconds
+    #[arg(long, default_value = "220")]
+    cursive_word_gap_ms: u64,
+
+    /// How long the pen must be continuously inactive (ms) after new writing
+    /// before the diary auto-triggers and answers
+    #[arg(long, default_value = "3500")]
+    idle_trigger_delay_ms: u64,
+
+    /// Disable the idle auto-trigger (corner tap still works)
+    #[arg(long)]
+    no_gesture: bool,
+
+    /// Log per-stroke pen activity for calibrating the idle trigger delay
+    #[arg(long)]
+    log_gestures: bool,
 
     /// Save current configuration to ~/.ghostwriter.toml and exit
     #[arg(long)]
@@ -365,6 +392,7 @@ async fn run_ghostwriter_loop(
 
     // Get initial config
     let config = shared_config.read().await.clone();
+    info!("Using model: {}", config.model);
 
     // Create coordinator channels
     let channels = CoordinatorChannels::new();
@@ -413,8 +441,25 @@ async fn run_ghostwriter_loop(
 
     let mut engine = create_engine(&engine_name, &engine_options)?;
 
+    // Shared state for the last spiral gesture anchor, consumed by the
+    // write_cursive tool and cleared by trigger_task on a corner tap.
+    let gesture_anchor: coordinator::GestureAnchor = Arc::new(TokioMutex::new(None));
+
+    // Shared flag so the gesture watcher can ignore the diary's own simulated
+    // pen strokes while write_cursive is drawing (they loop back onto the same
+    // input device the watcher reads from and would otherwise self-trigger).
+    let drawing_in_progress: ghostwriter::gesture::DrawingInProgress = Arc::new(AtomicBool::new(false));
+
     // Register tools
-    register_tools(&mut engine, Arc::clone(&keyboard), Arc::clone(&pen), Arc::clone(&touch), &config)?;
+    register_tools(
+        &mut engine,
+        Arc::clone(&keyboard),
+        Arc::clone(&pen),
+        Arc::clone(&touch),
+        &config,
+        &gesture_anchor,
+        Arc::clone(&drawing_in_progress),
+    )?;
 
     let engine = Arc::new(TokioMutex::new(engine));
 
@@ -424,7 +469,25 @@ async fn run_ghostwriter_loop(
         let trigger_tx = channels.trigger_tx.clone();
         let cancellation = Arc::clone(&cancellation);
         let no_trigger = config.no_trigger;
-        tokio::spawn(async move { coordinator::trigger_task(touch, trigger_tx, cancellation, no_trigger).await })
+        let gesture_anchor = Arc::clone(&gesture_anchor);
+        tokio::spawn(async move { coordinator::trigger_task(touch, trigger_tx, cancellation, no_trigger, gesture_anchor).await })
+    };
+
+    let gesture_handle = {
+        let trigger_tx = channels.trigger_tx.clone();
+        let cancellation = Arc::clone(&cancellation);
+        let gesture_anchor = Arc::clone(&gesture_anchor);
+        let drawing_in_progress = Arc::clone(&drawing_in_progress);
+        let idle_trigger_config = ghostwriter::gesture::IdleTriggerConfig {
+            idle_delay_ms: config.idle_trigger_delay_ms,
+        };
+        let watcher = ghostwriter::gesture::IdleWatcher::new(
+            config.no_gesture || config.no_draw,
+            idle_trigger_config,
+            config.log_gestures,
+            drawing_in_progress,
+        );
+        tokio::spawn(async move { coordinator::gesture_trigger_task(watcher, trigger_tx, cancellation, gesture_anchor).await })
     };
 
     let progress_handle = {
@@ -470,14 +533,14 @@ async fn run_ghostwriter_loop(
                     let engine_clone = Arc::clone(&engine);
                     let progress_tx_clone = progress_tx.clone();
                     let cancellation_clone = Arc::clone(&cancellation);
-                    let touch_clone = Arc::clone(&touch);
+                    let gesture_anchor_clone = Arc::clone(&gesture_anchor);
                     tokio::spawn(async move {
                         coordinator::processing_task(
                             config_clone,
                             engine_clone,
                             progress_tx_clone,
                             cancellation_clone,
-                            touch_clone,
+                            gesture_anchor_clone,
                         ).await
                     })
                 };
@@ -554,12 +617,29 @@ async fn run_ghostwriter_loop(
         Err(_) => info!("Progress task shutdown timed out"),
     }
 
+    match tokio::time::timeout(shutdown_timeout, gesture_handle).await {
+        Ok(Ok(Ok(_))) => info!("Gesture task completed successfully"),
+        Ok(Ok(Err(e))) => info!("Gesture task error: {}", e),
+        Ok(Err(e)) => info!("Gesture task join error: {}", e),
+        Err(_) => {
+            info!("Gesture task shutdown timed out - this is expected in no-gesture mode");
+        }
+    }
+
     info!("Main: clean shutdown complete");
     Ok(())
 }
 
 // Helper function to register tools with the engine
-fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>>, pen: Arc<Mutex<Pen>>, _touch: Arc<TokioRwLock<Touch>>, config: &Config) -> Result<()> {
+fn register_tools(
+    engine: &mut Box<dyn LLMEngine>,
+    keyboard: Arc<Mutex<Keyboard>>,
+    pen: Arc<Mutex<Pen>>,
+    _touch: Arc<TokioRwLock<Touch>>,
+    config: &Config,
+    gesture_anchor: &coordinator::GestureAnchor,
+    drawing_in_progress: ghostwriter::gesture::DrawingInProgress,
+) -> Result<()> {
     use serde_json::Value as json;
 
     // Register draw_text tool
@@ -600,6 +680,7 @@ fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>
         let keyboard_clone = Arc::clone(&keyboard);
         let pen_clone = Arc::clone(&pen);
         let test_mode = config.is_test_mode();
+        let drawing_in_progress = Arc::clone(&drawing_in_progress);
 
         let tool_config_draw_svg = load_config("tool_draw_svg.json");
         engine.register_tool(
@@ -619,34 +700,163 @@ fn register_tools(engine: &mut Box<dyn LLMEngine>, keyboard: Arc<Mutex<Keyboard>
                     }
                 }
 
-                // Switch to fineliner before drawing, remember original tool for restore
-                // Use a fresh Touch instance to avoid deadlock with trigger_task which
-                // holds the shared touch RwLock indefinitely while waiting for user trigger
-                let previous_tool = if !no_draw && !test_mode {
+                // Switch to fineliner before drawing. Use a fresh Touch instance to
+                // avoid deadlock with trigger_task, which holds the shared touch
+                // RwLock indefinitely while waiting for a corner-tap trigger. The
+                // tool is deliberately left on fineliner afterward (no restore) —
+                // see src/touch.rs's tool-palette-helpers comment for why.
+                if !no_draw && !test_mode {
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await
+                            let _ = Touch::new(false, TriggerCorner::UpperRight).select_fineliner().await;
                         })
-                    }).unwrap_or(PenTool::Unknown)
-                } else {
-                    PenTool::Unknown
-                };
+                    });
+                }
 
                 let mut keyboard = lock!(keyboard_clone);
                 let mut pen = lock!(pen_clone);
-                if let Err(e) = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw) {
+                // Suspend the idle watcher for the same reason write_cursive
+                // does: these strokes go out on the pen input device the
+                // watcher reads, and would otherwise count as fresh user
+                // writing — guaranteeing a spurious re-trigger one idle-delay
+                // after any draw_svg answer.
+                drawing_in_progress.store(true, Ordering::Relaxed);
+                let result = draw_svg(svg_data, &mut keyboard, &mut pen, save_bitmap.as_ref(), no_draw);
+                drawing_in_progress.store(false, Ordering::Relaxed);
+                if let Err(e) = result {
                     log::error!("Failed to draw SVG: {}", e);
                 }
                 drop(keyboard);
                 drop(pen);
+            }),
+        );
+    }
 
-                // Restore the original tool after drawing
-                if !no_draw && !test_mode && previous_tool != PenTool::Unknown {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            Touch::new(false, TriggerCorner::UpperRight).restore_tool(previous_tool).await
-                        })
-                    }).ok();
+    // Register write_cursive tool
+    if !config.no_svg {
+        let no_draw = config.no_draw;
+        let pen_clone = Arc::clone(&pen);
+        let cursive_config = ghostwriter::cursive::CursiveConfig {
+            layout: ghostwriter::cursive::LayoutConfig {
+                x_height_px: config.cursive_x_height_px,
+                ..Default::default()
+            },
+            word_gap_ms: config.cursive_word_gap_ms,
+            ..Default::default()
+        };
+        let font = ghostwriter::cursive::CursiveFont::embedded_allure()?;
+        let gesture_anchor = Arc::clone(gesture_anchor);
+
+        let tool_config_write_cursive = load_config("tool_write_cursive.json");
+        engine.register_tool(
+            "write_cursive",
+            serde_json::from_str::<serde_json::Value>(tool_config_write_cursive.as_str())?,
+            Box::new(move |arguments: json| {
+                let text = match arguments["text"].as_str() {
+                    Some(t) => t,
+                    None => {
+                        log::error!("write_cursive tool called without valid 'text' argument");
+                        return;
+                    }
+                };
+                // Clamp the left edge clear of the toolbar column: the model
+                // once chose x=50 and the answer's first letters sat hidden
+                // under the sidebar overlay (seen on a device screenshot).
+                let x = (arguments["x"].as_i64().unwrap_or(60) as f32).max(90.0);
+                let width = (arguments["width"].as_i64().unwrap_or(650) as f32).min(768.0 - 20.0 - x);
+                // Ignore the model's own y guess whenever we have a gesture anchor:
+                // it's measured directly from the real triple-tap position (ground
+                // truth), while the model's pixel-level guess from the screenshot
+                // has proven unreliable on real hardware — answers landed well
+                // above their own question, and each new answer landed above the
+                // previous one instead of below it. The anchor sits on the same
+                // line as the end of the question (the taps are drawn right after
+                // it), so drop below it before starting the answer.
+                //
+                // This clearance is a fixed screen-space margin, deliberately NOT
+                // derived from the answer's own (small, 14px) cursive x-height: an
+                // earlier version used `x_height_px * line_spacing_mult` (~31px)
+                // and the answer still overlapped the question, because that's far
+                // smaller than a typical line of the user's own (much larger)
+                // handwriting — confirmed on a device screenshot where the offset
+                // wasn't enough to clear the question's own descenders.
+                const ANCHOR_CLEARANCE_PX: f32 = 70.0;
+                let anchor = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async { gesture_anchor.lock().await.map(|t| t.anchor) }));
+                let y = match anchor {
+                    Some((_, anchor_y)) => anchor_y + ANCHOR_CLEARANCE_PX,
+                    None => arguments["y"].as_i64().map(|v| v as f32).unwrap_or(400.0),
+                };
+                info!(
+                    "write_cursive: placing at x={:.1}, y={:.1} (model proposed x={:?}, y={:?}; anchor={:?}), text={:?}",
+                    x,
+                    y,
+                    arguments["x"].as_i64(),
+                    arguments["y"].as_i64(),
+                    anchor,
+                    text
+                );
+
+                if !no_draw {
+                    // Estimate the answer's ink bottom by dry-running the layout,
+                    // and if it would clip past the viewport bottom (ink beyond
+                    // y=1024 is silently lost — confirmed on device by a long
+                    // answer whose tail never appeared), scroll the canvas up
+                    // first. Scrolling is closed-loop (fling + measure, see
+                    // src/scroll.rs) because reMarkable flings have momentum;
+                    // the drawing y is then adjusted by the MEASURED shift.
+                    const BOTTOM_MARGIN: f32 = 24.0;
+                    let mut y_draw = y;
+                    {
+                        let placement = ghostwriter::cursive::Placement { x, y, max_width: width };
+                        let words = ghostwriter::cursive::layout::layout(&font, text, &placement, &cursive_config.layout);
+                        let ink_bottom = words
+                            .iter()
+                            .flat_map(|w| w.strokes.iter())
+                            .flat_map(|s| s.iter())
+                            .map(|p| p.1)
+                            .fold(0.0f32, f32::max);
+                        if ink_bottom > 1024.0 - BOTTOM_MARGIN {
+                            let needed = ink_bottom - (1024.0 - BOTTOM_MARGIN);
+                            info!("write_cursive: answer would clip (ink bottom {:.0}px), scrolling for {:.0}px of room", ink_bottom, needed);
+                            let shift = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(ghostwriter::scroll::scroll_up_to_make_room(needed))
+                            })
+                            .unwrap_or_else(|e| {
+                                log::error!("write_cursive: scroll failed: {}", e);
+                                0.0
+                            });
+                            if shift > 0.0 {
+                                // The question (and everything else) moved up by
+                                // `shift`; follow it. If the question scrolled
+                                // clear off the top, everything below the top
+                                // margin is blank space beneath it on the canvas.
+                                y_draw = (y - shift).max(60.0);
+                                info!("write_cursive: scrolled {:.0}px, drawing at adjusted y={:.1}", shift, y_draw);
+                            } else {
+                                info!("write_cursive: page did not scroll (fixed page or at limit), drawing as placed");
+                            }
+                        }
+                    }
+
+                    // Deliberately does NOT switch pen tool before drawing — draws
+                    // with whatever tool the user currently has selected. An earlier
+                    // version called select_calligraphy_pen() here, but that left the
+                    // tool changed after every answer (no safe way to restore an
+                    // arbitrary previous tool — see src/touch.rs's tool-palette-helpers
+                    // comment), which surprised the user's own subsequent writing.
+                    // Trading pen-style consistency for not touching the user's tool
+                    // state at all.
+                    let placement = ghostwriter::cursive::Placement { x, y: y_draw, max_width: width };
+                    let seed = text.len() as u64 ^ (x as u64) << 8 ^ (y as u64) << 16;
+                    // Suspend the gesture watcher while drawing: our own simulated
+                    // pen strokes loop back onto the same input device it reads
+                    // from and would otherwise be mistaken for real taps.
+                    drawing_in_progress.store(true, Ordering::Relaxed);
+                    let result = ghostwriter::cursive::write_cursive(&mut lock!(pen_clone), &font, text, &placement, &cursive_config, seed);
+                    drawing_in_progress.store(false, Ordering::Relaxed);
+                    if let Err(e) = result {
+                        log::error!("Failed to write cursive: {}", e);
+                    }
                 }
             }),
         );
